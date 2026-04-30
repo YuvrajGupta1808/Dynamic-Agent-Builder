@@ -1,5 +1,6 @@
 import type {
   AppConfig,
+  ChatTurn,
   DiffResponse,
   FileContentResponse,
   FileTreeNode,
@@ -120,10 +121,11 @@ export function decideInterrupt(runId: string, interruptId: string, decision: "a
 
 export async function streamRun(
   sessionId: string,
-  payload: { message: string; model?: string; mode?: SessionMode },
+  payload: { message: string; messages?: ChatTurn[]; model?: string; mode?: SessionMode },
   onEvent: (event: StreamEvent) => void,
 ) {
-  const STREAM_TIMEOUT_MS = 90_000;
+  // Backend stall guard can exceed 120s without tokens; keep above that plus buffer.
+  const STREAM_TIMEOUT_MS = 210_000;
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   const resetTimeout = (controller: AbortController) => {
     if (timeoutHandle) clearTimeout(timeoutHandle);

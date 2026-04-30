@@ -15,7 +15,7 @@ import {
   SquareTerminal,
   X
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
 
 import { FileTree } from "./components/FileTree";
 import { Button } from "./components/ui/button";
@@ -41,11 +41,7 @@ import type {
 } from "./types/api";
 
 export function App() {
-  const FIREWORKS_MODEL_OPTIONS = [
-    "openai:accounts/fireworks/models/qwen3p6-plus",
-    "openai:accounts/fireworks/models/minimax-m2",
-    "openai:accounts/fireworks/models/kimi-k2-thinking",
-  ] as const;
+  const FIREWORKS_MODEL_OPTIONS = ["openai:accounts/fireworks/models/qwen3p6-plus"] as const;
   type ThinkingItem = {
     id: string;
     kind: "tool" | "thinking" | "error";
@@ -61,6 +57,8 @@ export function App() {
     id: string;
     title: string;
     runs: CompletedRun[];
+    /** Backend session id + metadata; one per UI chat, lazy-created on first send. */
+    backendSession?: SessionRecord | null;
   };
 
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -89,12 +87,41 @@ export function App() {
   const [showActions, setShowActions] = useState(false);
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([{ id: crypto.randomUUID(), title: "Agents", runs: [] }]);
   const [activeThreadId, setActiveThreadId] = useState<string>("");
+  const activeThread = chatThreads.find((thread) => thread.id === activeThreadId) ?? chatThreads[0];
   const streamBufferRef = useRef("");
   const structuredEventsSeenRef = useRef(false);
   const backendFailureRef = useRef(false);
   const lastDerivedThinkingKeyRef = useRef("");
   const runInFlightRef = useRef(false);
   const didBootRef = useRef(false);
+  const chatPaneRef = useRef<HTMLDivElement>(null);
+  const terminalOutputRef = useRef<HTMLPreElement>(null);
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const COMPOSER_TEXTAREA_MAX_PX = 320;
+
+  const resizeComposerTextarea = useCallback(() => {
+    const ta = composerTextareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, COMPOSER_TEXTAREA_MAX_PX)}px`;
+  }, []);
+
+  const scrollChatToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      const el = chatPaneRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+    });
+  }, []);
+
+  const scrollTerminalToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      const el = terminalOutputRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+    });
+  }, []);
 
   useEffect(() => {
     if (didBootRef.current) return;
@@ -107,6 +134,27 @@ export function App() {
       setActiveThreadId(chatThreads[0].id);
     }
   }, [activeThreadId, chatThreads]);
+
+  useLayoutEffect(() => {
+    resizeComposerTextarea();
+  }, [prompt, resizeComposerTextarea]);
+
+  useLayoutEffect(() => {
+    scrollChatToBottom();
+  }, [
+    scrollChatToBottom,
+    thinkingItems,
+    streamingAssistantText,
+    finalOutput,
+    lastSubmittedPrompt,
+    isRunning,
+    activeThreadId,
+    activeThread?.runs.length,
+  ]);
+
+  useLayoutEffect(() => {
+    scrollTerminalToBottom();
+  }, [scrollTerminalToBottom, terminalLines]);
 
   const editorLanguage = useMemo(() => {
     if (selectedPath.endsWith(".py")) return "python";
@@ -153,8 +201,6 @@ export function App() {
     backendFailureRef.current = false;
     lastDerivedThinkingKeyRef.current = "";
     const firstThreadId = crypto.randomUUID();
-    setChatThreads([{ id: firstThreadId, title: "Agents", runs: [] }]);
-    setActiveThreadId(firstThreadId);
     setTerminalLines((current) => [...current, `$ workspace ${name}`]);
     const modelForSession = selectedModel || activeConfig.defaultModel;
     const created = await createSession({
@@ -163,6 +209,8 @@ export function App() {
       mode: "accept_edits",
       model: modelForSession,
     });
+    setChatThreads([{ id: firstThreadId, title: "Agents", runs: [], backendSession: created }]);
+    setActiveThreadId(firstThreadId);
     setSession(created);
     await refreshWorkspace(created.id);
     setError(null);
@@ -247,7 +295,7 @@ export function App() {
     let latestErrorText = "";
     let liveThinkingItems: ThinkingItem[] = [];
     const activeModel = selectedModel || config.defaultModel;
-    const executeRun = async (sessionId: string) => {
+    const executeRun = async (sessionId: string, priorRuns: CompletedRun[]) => {
       setChatThreads((current) =>
         current.map((thread) =>
           thread.id === threadIdAtSend && thread.runs.length === 0
@@ -255,7 +303,19 @@ export function App() {
             : thread,
         ),
       );
-      await streamRun(sessionId, { message: userPrompt, model: activeModel, mode: "accept_edits" }, (event) => {
+      const transcriptMessages = priorRuns.flatMap((r) => [
+        { role: "user" as const, content: r.prompt },
+        { role: "assistant" as const, content: r.finalOutput },
+      ]);
+      await streamRun(
+        sessionId,
+        {
+          message: userPrompt,
+          messages: [...transcriptMessages, { role: "user", content: userPrompt }],
+          model: activeModel,
+          mode: "accept_edits",
+        },
+        (event) => {
         sawAnyEvent = true;
         const terminalLine = terminalLineForEvent(event);
         if (terminalLine) {
@@ -293,7 +353,7 @@ export function App() {
           backendFailureRef.current = true;
           const errText = (event.message || "Agent run failed").trim();
           latestErrorText = errText;
-          setError(errText);
+          // Keep error in the chat timeline only (thinking/tool cards); avoid duplicating in bottom banner.
         }
         if (event.type === "token" && event.message) {
           sawAssistantToken = true;
@@ -322,115 +382,23 @@ export function App() {
     };
 
     try {
-      // Always create a fresh session per run to avoid stale/broken session IDs.
-      const liveSession = await createSession({
-        workspace: activeWorkspace,
-        workspaceMode: "local",
-        mode: "accept_edits",
-        model: activeModel,
-      });
-      setSession(liveSession);
-      await executeRun(liveSession.id);
-      const noAssistantOutput =
-        !runFinalOutput.trim() ||
-        /no stream events received from backend/i.test(runFinalOutput) ||
-        /run completed, but no assistant response text was returned/i.test(runFinalOutput) ||
-        /run completed without assistant text/i.test(runFinalOutput) ||
-        /run stalled:/i.test(runFinalOutput);
-      const shouldFallback =
-        activeModel.toLowerCase().includes("minimax-m2") && noAssistantOutput;
-      if (shouldFallback) {
-        const fallbackModel = "openai:accounts/fireworks/models/qwen3p6-plus";
-        setTerminalLines((current) => [
-          ...current,
-          `[info] ${formatModelLabel(activeModel)} produced no assistant output. Retrying with ${formatModelLabel(fallbackModel)}...`,
-        ]);
-        setThinkingItems([]);
-        setFinalOutput("");
-        setStreamingAssistantText("");
-        streamBufferRef.current = "";
-        liveThinkingItems = [];
-        runFinalOutput = "";
-        latestReasoningText = "";
-        sawAssistantToken = false;
-        sawAnyEvent = false;
+      const threadSnapshot = chatThreads.find((t) => t.id === threadIdAtSend);
+      let sessionForRun = threadSnapshot?.backendSession ?? null;
 
-        const fallbackSession = await createSession({
+      if (!sessionForRun) {
+        sessionForRun = await createSession({
           workspace: activeWorkspace,
           workspaceMode: "local",
           mode: "accept_edits",
-          model: fallbackModel,
+          model: activeModel,
         });
-        setSession(fallbackSession);
-        setSelectedModel(fallbackModel);
-        await streamRun(
-          fallbackSession.id,
-          { message: userPrompt, model: fallbackModel, mode: "accept_edits" },
-          (event) => {
-            sawAnyEvent = true;
-            const terminalLine = terminalLineForEvent(event);
-            if (terminalLine) {
-              setTerminalLines((current) => [...current, terminalLine]);
-            }
-            const thinkingText = thinkingLineForEvent(event);
-            if (thinkingText) {
-              const kind = thinkingKindForEvent(event);
-              if (kind === "thinking") latestReasoningText = thinkingText;
-              const last = liveThinkingItems[liveThinkingItems.length - 1];
-              if (kind === "thinking" && last && last.kind === "thinking") {
-                const joiner = last.text.endsWith(" ") || thinkingText.startsWith(" ") ? "" : " ";
-                liveThinkingItems = [
-                  ...liveThinkingItems.slice(0, -1),
-                  { ...last, text: `${last.text}${joiner}${thinkingText}`.trim() },
-                ];
-              } else if (!(last && last.kind === kind && last.text === thinkingText)) {
-                liveThinkingItems = [...liveThinkingItems, { id: crypto.randomUUID(), kind, text: thinkingText }];
-              }
-              setThinkingItems(liveThinkingItems);
-            }
-            if (
-              event.type === "thinking" ||
-              event.type === "tool_call" ||
-              event.type === "approval_required" ||
-              event.type === "file_change" ||
-              event.type === "todo" ||
-              event.type === "custom" ||
-              event.type === "update"
-            ) {
-              structuredEventsSeenRef.current = true;
-            }
-            if (event.type === "error") {
-              structuredEventsSeenRef.current = true;
-              backendFailureRef.current = true;
-              const errText = (event.message || "Agent run failed").trim();
-              latestErrorText = errText;
-              setError(errText);
-            }
-            if (event.type === "token" && event.message) {
-              sawAssistantToken = true;
-              streamBufferRef.current += event.message;
-              setStreamingAssistantText(streamBufferRef.current);
-            }
-            if (event.type === "approval_required") {
-              setApproval(event.data as unknown as ApprovalData);
-            }
-            if (event.type === "done") {
-              if (streamBufferRef.current.trim()) {
-                setFinalOutput(streamBufferRef.current.trim());
-                runFinalOutput = streamBufferRef.current.trim();
-                streamBufferRef.current = "";
-                setStreamingAssistantText("");
-              } else if (!sawAssistantToken && latestReasoningText.trim()) {
-                setFinalOutput(latestReasoningText.trim());
-                runFinalOutput = latestReasoningText.trim();
-              } else if (!runFinalOutput) {
-                runFinalOutput = "Run completed without assistant text.";
-                setFinalOutput(runFinalOutput);
-              }
-            }
-          },
+        setChatThreads((prev) =>
+          prev.map((t) => (t.id === threadIdAtSend ? { ...t, backendSession: sessionForRun } : t)),
         );
       }
+
+      setSession(sessionForRun);
+      await executeRun(sessionForRun.id, threadSnapshot?.runs ?? []);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Agent run failed";
       setError(message);
@@ -521,7 +489,7 @@ export function App() {
   function newTask() {
     const nextIndex = chatThreads.length + 1;
     const id = crypto.randomUUID();
-    setChatThreads((current) => [{ id, title: `Chat ${nextIndex}`, runs: [] }, ...current]);
+    setChatThreads((current) => [{ id, title: `Chat ${nextIndex}`, runs: [], backendSession: undefined }, ...current]);
     setActiveThreadId(id);
     setAgentTitle(`Chat ${nextIndex}`);
     setPrompt("");
@@ -540,8 +508,6 @@ export function App() {
     setAgentTitle("Agents");
     setShowActions(false);
   }
-
-  const activeThread = chatThreads.find((thread) => thread.id === activeThreadId) ?? chatThreads[0];
 
   return (
     <main className="ide-shell">
@@ -646,7 +612,9 @@ export function App() {
               Clear
             </Button>
           </div>
-          <pre className="terminal-output">{terminalLines.join("\n")}</pre>
+          <pre className="terminal-output" ref={terminalOutputRef} tabIndex={-1}>
+            {terminalLines.join("\n")}
+          </pre>
         </section>
       </section>
 
@@ -662,6 +630,7 @@ export function App() {
                     onClick={() => {
                       setActiveThreadId(thread.id);
                       setAgentTitle(thread.title);
+                      if (thread.backendSession) setSession(thread.backendSession);
                     }}
                     title={thread.title}
                   >
@@ -697,6 +666,7 @@ export function App() {
                     onClick={() => {
                       setActiveThreadId(thread.id);
                       setAgentTitle(thread.title);
+                      if (thread.backendSession) setSession(thread.backendSession);
                       setShowHistory(false);
                     }}
                   >
@@ -725,7 +695,7 @@ export function App() {
 
         <div className="agent-pane-body">
           <div className="agent-stage">
-            <div className="agent-timeline">
+            <div className="agent-timeline" ref={chatPaneRef}>
               {!activeThread?.runs.length && !lastSubmittedPrompt && thinkingItems.length === 0 && !streamingAssistantText && !finalOutput ? (
                 <div className="agent-empty-state">
                   <h3>How can I help you today?</h3>
@@ -738,7 +708,13 @@ export function App() {
                       <article className="timeline-card user">{renderTextWithCodeFences(run.prompt)}</article>
                       {run.thinkingItems.map((entry) => (
                         <article className={`timeline-card ${entry.kind}`} key={entry.id}>
-                          {entry.kind === "tool" || entry.kind === "error" ? <pre>{entry.text}</pre> : <p>{entry.text}</p>}
+                          {entry.kind === "thinking" ? (
+                            renderTextWithCodeFences(entry.text, "preserveLines")
+                          ) : entry.kind === "tool" || entry.kind === "error" ? (
+                            <pre>{entry.text}</pre>
+                          ) : (
+                            <p>{entry.text}</p>
+                          )}
                         </article>
                       ))}
                       {run.finalOutput && <article className="timeline-card assistant">{renderTextWithCodeFences(run.finalOutput)}</article>}
@@ -752,7 +728,13 @@ export function App() {
                       </article>
                       {thinkingItems.map((entry) => (
                         <article className={`timeline-card ${entry.kind}`} key={entry.id}>
-                          {entry.kind === "tool" || entry.kind === "error" ? <pre>{entry.text}</pre> : <p>{entry.text}</p>}
+                          {entry.kind === "thinking" ? (
+                            renderTextWithCodeFences(entry.text, "preserveLines")
+                          ) : entry.kind === "tool" || entry.kind === "error" ? (
+                            <pre>{entry.text}</pre>
+                          ) : (
+                            <p>{entry.text}</p>
+                          )}
                         </article>
                       ))}
                       {isRunning && thinkingItems.length === 0 && !streamingAssistantText && !finalOutput && (
@@ -773,10 +755,15 @@ export function App() {
 
             <section className="agent-composer">
               <Textarea
-                className="agent-textarea"
+                ref={composerTextareaRef}
+                className="agent-textarea !min-h-[52px] border-0 bg-transparent px-0 py-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
                 value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
+                onChange={(event) => {
+                  setPrompt(event.target.value);
+                  queueMicrotask(resizeComposerTextarea);
+                }}
                 placeholder="Ask anything, @ to mention, / for workflows..."
+                rows={1}
               />
               <div className="agent-composer-footer">
                 <div className="agent-composer-tools">
@@ -947,21 +934,28 @@ function thinkingLineForEvent(event: StreamEvent): string | null {
   return null;
 }
 
-function renderTextWithCodeFences(text: string) {
+/** Matches ``` fences with optional lang; allows newline after opener to be optional (provider quirks). */
+const CODE_FENCE_RE = /```(?:[a-zA-Z0-9_-]*)?\s*\n?([\s\S]*?)```/g;
+
+type RichTextMode = "reflow" | "preserveLines";
+
+function renderTextWithCodeFences(text: string, mode: RichTextMode = "reflow") {
   const nodes: ReactElement[] = [];
-  const fenceRe = /```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let idx = 0;
 
-  for (const match of text.matchAll(fenceRe)) {
+  for (const match of text.matchAll(CODE_FENCE_RE)) {
     const full = match[0];
     const code = match[1] ?? "";
     const start = match.index ?? 0;
 
     if (start > lastIndex) {
+      const slice = text.slice(lastIndex, start);
       nodes.push(
         <span key={`t-${idx++}`}>
-          {renderMarkdownishText(text.slice(lastIndex, start), `m-${idx}`)}
+          {mode === "reflow"
+            ? renderMarkdownishText(slice, `m-${idx}`)
+            : renderMarkdownishPreserveLines(slice, `m-${idx}`)}
         </span>,
       );
     }
@@ -976,7 +970,12 @@ function renderTextWithCodeFences(text: string) {
   }
 
   if (lastIndex < text.length) {
-    nodes.push(<span key={`t-${idx++}`}>{renderMarkdownishText(text.slice(lastIndex), `m-${idx}`)}</span>);
+    const tail = text.slice(lastIndex);
+    nodes.push(
+      <span key={`t-${idx++}`}>
+        {mode === "reflow" ? renderMarkdownishText(tail, `m-${idx}`) : renderMarkdownishPreserveLines(tail, `m-${idx}`)}
+      </span>,
+    );
   }
 
   return <div className="timeline-rich-text">{nodes}</div>;
@@ -989,6 +988,22 @@ function renderMarkdownishText(raw: string, keyPrefix: string): ReactElement {
     <div className="rich-markdownish">
       {lines.map((line, i) => (
         <p key={`${keyPrefix}-${i}`}>{renderInlineBold(line, `${keyPrefix}-b-${i}`)}</p>
+      ))}
+    </div>
+  );
+}
+
+/** Reasoning streams: keep model line breaks; do not merge into one paragraph. */
+function renderMarkdownishPreserveLines(raw: string, keyPrefix: string): ReactElement {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+
+  return (
+    <div className="rich-markdownish rich-markdownish-preserve">
+      {lines.map((line, i) => (
+        <p key={`${keyPrefix}-ln-${i}`}>
+          {line.length ? renderInlineBold(line, `${keyPrefix}-b-${i}`) : "\u00a0"}
+        </p>
       ))}
     </div>
   );

@@ -1,6 +1,9 @@
 export type WorkspaceMode = "local" | "uploaded" | "remote_sandbox";
 export type SessionMode = "ask_before_edits" | "accept_edits" | "accept_everything";
 
+/** One chat turn for multi-turn agent runs (matches backend `ChatMessage`). */
+export type ChatTurn = { role: "user" | "assistant" | "system"; content: string };
+
 export interface AppConfig {
   defaultModel: string;
   models: Array<{ value: string; name: string }>;
