@@ -3,9 +3,8 @@
 from fastapi import APIRouter, Depends
 
 from ..core.config import Settings, get_settings
-from ..infra.security import require_auth
 
-router = APIRouter(prefix="/api", tags=["config"], dependencies=[Depends(require_auth)])
+router = APIRouter(prefix="/api", tags=["config"])
 
 
 @router.get("/config")

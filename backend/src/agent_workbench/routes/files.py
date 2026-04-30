@@ -6,11 +6,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 
 from ..core.dependencies import get_store, get_workspace_manager
 from ..domain.models import ApplyFileRequest
-from ..infra.security import require_auth
 from ..infra.session_store import SessionStore
 from ..infra.workspace import WorkspaceManager
 
-router = APIRouter(prefix="/api", tags=["files"], dependencies=[Depends(require_auth)])
+router = APIRouter(prefix="/api", tags=["files"])
 
 
 @router.get("/sessions/{session_id}/files/tree")

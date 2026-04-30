@@ -77,6 +77,10 @@ class Settings:
     max_tree_entries: int = 2_000
     command_timeout_seconds: int = 120
     command_output_bytes: int = 80_000
+    clerk_jwks_url: str | None = None
+    clerk_issuer: str | None = None
+    local_user_namespace: str = "_local"
+    allow_legacy_token_with_clerk: bool = False
 
     @property
     def remote_sandbox_enabled(self) -> bool:
@@ -104,6 +108,7 @@ class Settings:
             "workspaceRoot": str(self.workspace_root),
             "currentWorkingDirectory": str(Path.cwd()),
             "tokenRequired": True,
+            "clerkAuthEnabled": bool(self.clerk_jwks_url),
         }
 
     def dump_json(self) -> str:
@@ -141,4 +146,8 @@ def get_settings() -> Settings:
         max_tree_entries=int(os.getenv("WORKBENCH_MAX_TREE_ENTRIES", "2000")),
         command_timeout_seconds=int(os.getenv("WORKBENCH_COMMAND_TIMEOUT_SECONDS", "120")),
         command_output_bytes=int(os.getenv("WORKBENCH_COMMAND_OUTPUT_BYTES", "80000")),
+        clerk_jwks_url=os.getenv("WORKBENCH_CLERK_JWKS_URL") or None,
+        clerk_issuer=os.getenv("WORKBENCH_CLERK_ISSUER") or None,
+        local_user_namespace=os.getenv("WORKBENCH_LOCAL_USER_NAMESPACE", "_local"),
+        allow_legacy_token_with_clerk=os.getenv("WORKBENCH_ALLOW_LEGACY_TOKEN_WITH_CLERK", "false").lower() in {"1", "true", "yes"},
     )

@@ -51,9 +51,16 @@ class WorkspaceManager:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.settings.workspace_root.mkdir(parents=True, exist_ok=True)
 
-    def create(self, mode: WorkspaceMode, cwd: str | None, workspace_name: str | None = None) -> Workspace:
+    def create(
+        self,
+        mode: WorkspaceMode,
+        cwd: str | None,
+        workspace_name: str | None = None,
+        *,
+        user_id: str | None = None,
+    ) -> Workspace:
         session_id = uuid4().hex
-        root = self.root_for(mode, session_id, cwd, workspace_name)
+        root = self.root_for(mode, session_id, cwd, workspace_name, user_id=user_id)
         root.mkdir(parents=True, exist_ok=True)
         return Workspace(
             session_id=session_id,
@@ -62,26 +69,60 @@ class WorkspaceManager:
             remote_enabled=self.settings.remote_sandbox_enabled,
         )
 
-    def root_for(self, mode: WorkspaceMode, session_id: str, cwd: str | None, workspace_name: str | None = None) -> Path:
+    def root_for(
+        self,
+        mode: WorkspaceMode,
+        session_id: str,
+        cwd: str | None,
+        workspace_name: str | None = None,
+        *,
+        user_id: str | None = None,
+    ) -> Path:
         if mode == "local":
-            if workspace_name:
-                return self.workspace_path(workspace_name)
-            requested = Path(cwd or Path.cwd())
-            return ensure_allowed_root(requested, self.settings)
+            if not workspace_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="workspace is required for local workspace mode",
+                )
+            if not user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Workspace creation requires authenticated user context",
+                )
+            return self.workspace_path(user_id, workspace_name)
         if mode == "uploaded":
             return (self.settings.data_dir / "uploads" / session_id).resolve()
         return (self.settings.data_dir / "remote_sandbox" / session_id).resolve()
 
-    def list_workspaces(self) -> list[dict[str, str]]:
-        self.ensure_workspace("default")
+    def list_workspaces(self, user_id: str) -> list[dict[str, str]]:
+        base = self.user_workspace_root(user_id)
+        if not base.is_dir():
+            return []
         workspaces = []
-        for path in sorted(self.settings.workspace_root.iterdir(), key=lambda item: item.name.lower()):
+        for path in sorted(base.iterdir(), key=lambda item: item.name.lower()):
             if path.is_dir() and not path.name.startswith("."):
                 workspaces.append({"name": path.name, "path": str(path.resolve())})
         return workspaces
 
-    def ensure_workspace(self, name: str) -> Path:
-        root = self.workspace_path(name)
+    def user_workspace_root(self, user_id: str) -> Path:
+        ns = sanitize_user_namespace(user_id)
+        root = (self.settings.workspace_root / ns).resolve()
+        ensure_allowed_root(root, self.settings)
+        return root
+
+    def workspace_path(self, user_id: str, name: str) -> Path:
+        base = self.user_workspace_root(user_id)
+        slug = sanitize_workspace_name(name)
+        resolved = (base / slug).resolve()
+        ensure_allowed_root(resolved, self.settings)
+        try:
+            resolved.relative_to(base)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspace path") from exc
+        return resolved
+
+    def ensure_workspace(self, user_id: str, name: str) -> Path:
+        root = self.workspace_path(user_id, name)
         root.mkdir(parents=True, exist_ok=True)
         readme = root / "README.md"
         if not readme.exists():
@@ -89,12 +130,6 @@ class WorkspaceManager:
                 f"# {root.name}\n\nThis managed workspace is isolated from the main repository by default.\n",
                 encoding="utf-8",
             )
-        return root
-
-    def workspace_path(self, name: str) -> Path:
-        slug = sanitize_workspace_name(name)
-        root = (self.settings.workspace_root / slug).resolve()
-        ensure_allowed_root(root, self.settings)
         return root
 
     def tree(self, root: Path) -> FileTreeNode:
@@ -193,8 +228,15 @@ def create_uploaded_seed(root: Path) -> None:
         readme.write_text("# Uploaded Workspace\n\nAdd files using the upload endpoint or UI.\n", encoding="utf-8")
 
 
+def sanitize_user_namespace(user_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", user_id.strip()).strip(".").strip("-")
+    if not cleaned:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user identifier")
+    return cleaned[:120]
+
+
 def sanitize_workspace_name(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip()).strip(".-")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip()).strip(".").strip("-")
     if not cleaned:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace name is required")
     if cleaned in {".", ".."}:

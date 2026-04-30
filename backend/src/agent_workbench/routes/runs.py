@@ -6,11 +6,11 @@ from fastapi.responses import StreamingResponse
 from ..core.config import Settings, get_settings
 from ..core.dependencies import get_store
 from ..domain.models import InterruptDecision, RunStreamRequest
-from ..infra.security import require_auth, validate_model
+from ..infra.security import validate_model
 from ..infra.session_store import SessionStore
 from ..services.streaming import stream_run
 
-router = APIRouter(prefix="/api", tags=["runs"], dependencies=[Depends(require_auth)])
+router = APIRouter(prefix="/api", tags=["runs"])
 
 
 @router.post("/sessions/{session_id}/runs/stream")

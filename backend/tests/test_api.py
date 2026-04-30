@@ -33,16 +33,16 @@ def test_config_requires_auth(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_create_session_and_stream(tmp_path: Path, monkeypatch) -> None:
-    workspace = tmp_path / "workspaces" / "project"
-    workspace.mkdir(parents=True)
-    (workspace / "README.md").write_text("# Project\n", encoding="utf-8")
     client = client_for(tmp_path, monkeypatch)
+
+    workspace_response = client.post("/api/workspaces", headers=auth_headers(), json={"name": "project"})
+    assert workspace_response.status_code == 200
 
     session_response = client.post(
         "/api/sessions",
         headers=auth_headers(),
         json={
-            "cwd": str(workspace),
+            "workspace": "project",
             "workspaceMode": "local",
             "mode": "accept_everything",
             "model": "mock:deterministic",
@@ -50,10 +50,12 @@ def test_create_session_and_stream(tmp_path: Path, monkeypatch) -> None:
     )
     assert session_response.status_code == 200
     session_id = session_response.json()["id"]
+    assert session_response.json()["cwd"].endswith("/workspaces/_local/project")
 
     tree_response = client.get(f"/api/sessions/{session_id}/files/tree", headers=auth_headers())
     assert tree_response.status_code == 200
-    assert tree_response.json()["children"][0]["name"] == "README.md"
+    children = tree_response.json().get("children") or []
+    assert children and children[0]["name"] == "README.md"
 
     with client.stream(
         "POST",
@@ -88,4 +90,4 @@ def test_managed_workspace_create_and_session(tmp_path: Path, monkeypatch) -> No
         },
     )
     assert session_response.status_code == 200
-    assert session_response.json()["cwd"].endswith("/workspaces/Client-App")
+    assert session_response.json()["cwd"].endswith("/workspaces/_local/Client-App")
