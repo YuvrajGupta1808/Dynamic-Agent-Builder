@@ -1118,6 +1118,64 @@ p,
   margin: 0;
 }
 
+.timeline-card .markdown-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.timeline-card .markdown-content > * {
+  margin: 0;
+}
+
+.timeline-card .markdown-content ul,
+.timeline-card .markdown-content ol {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.timeline-card .markdown-content li {
+  margin: 2px 0;
+}
+
+.timeline-card .markdown-content table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid hsl(220 11% 24%);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.timeline-card .markdown-content th,
+.timeline-card .markdown-content td {
+  border: 1px solid hsl(220 11% 24%);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.timeline-card .markdown-content th {
+  background: hsl(222 15% 12%);
+  color: hsl(220 16% 88%);
+}
+
+.timeline-card .markdown-content .inline-code {
+  background: hsl(222 15% 12%);
+  border: 1px solid hsl(220 11% 24%);
+  border-radius: 5px;
+  padding: 1px 4px;
+  font-family: "JetBrains Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.timeline-card .markdown-content blockquote {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid hsl(var(--border));
+  color: hsl(var(--muted-foreground));
+}
+
 .timeline-card {
   width: min(100%, 94%);
   margin: 0 auto;

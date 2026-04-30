@@ -3,15 +3,16 @@ uvicorn[standard]>=0.30.0
 pydantic>=2.8.0
 python-dotenv>=1.0.1
 python-multipart>=0.0.9
+PyJWT[crypto]>=2.9.0
 
 [deepagents]
 deepagents>=0.0.1
-deepagents-acp>=0.0.1
 langgraph>=0.2.0
 langchain-core>=0.3.0
 langchain-ollama>=0.2.0
 langchain-openai>=0.2.0
 langchain-anthropic>=0.2.0
+tavily-python>=0.5.0
 
 [test]
 pytest>=8.0.0

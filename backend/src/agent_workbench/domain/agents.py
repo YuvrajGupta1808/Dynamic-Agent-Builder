@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from ..infra.security import redact_env
 from .fireworks_openai import FireworksReasoningChatOpenAI
@@ -24,11 +24,22 @@ except Exception:  # pragma: no cover - exercised in environments without deepag
     StoreBackend = None  # type: ignore[assignment]
     ChatOpenAI = None  # type: ignore[assignment]
 
+try:
+    from tavily import TavilyClient
+except Exception:  # pragma: no cover - optional dependency
+    TavilyClient = None  # type: ignore[assignment]
+
 
 SYSTEM_PROMPT = """You are a production coding agent running in a local workbench.
 Work carefully inside the configured workspace, maintain a concise todo list, stream meaningful progress, and verify changes with focused tests.
 Never read or write secret files. Ask for approval before shell commands when the current session mode requires it.
-Prefer small, reviewable edits and explain tradeoffs when a task has safety or deployment implications."""
+Prefer small, reviewable edits and explain tradeoffs when a task has safety or deployment implications.
+If the `quick_search` tool is available, use it for fast real-time web lookups when requests depend on current external information.
+
+Realtime data policy:
+- If a user asks for "current", "latest", "today", "right now", live prices, market moves, breaking news, or time-sensitive facts, call `quick_search` before answering.
+- Do not claim you lack real-time access when `quick_search` is available.
+- Summarize results with source-aware caveats when data may be delayed."""
 
 SUBAGENTS: list[dict[str, str]] = [
     {
@@ -52,6 +63,30 @@ SUBAGENTS: list[dict[str, str]] = [
         "system_prompt": "Run only approved commands, keep output concise, and identify the next fix.",
     },
 ]
+
+
+def _quick_search_tool() -> Any | None:
+    """Return a lightweight internet search tool when Tavily is configured."""
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key or TavilyClient is None:
+        return None
+    client = TavilyClient(api_key=api_key)
+
+    def quick_search(
+        query: str,
+        max_results: int = 5,
+        topic: Literal["general", "news", "finance"] = "general",
+        include_raw_content: bool = False,
+    ) -> dict[str, Any]:
+        """Quickly search the internet for real-time information."""
+        return client.search(
+            query=query,
+            max_results=max_results,
+            topic=topic,
+            include_raw_content=include_raw_content,
+        )
+
+    return quick_search
 
 
 def get_interrupt_config(mode_id: SessionMode) -> dict[str, Any]:
@@ -270,6 +305,9 @@ def build_agent(
         "store": resolved_store,
         "checkpointer": resolved_checkpointer,
     }
+    quick_search_tool = _quick_search_tool()
+    if quick_search_tool is not None:
+        kwargs["tools"] = [quick_search_tool]
     # Deep Agents 0.5.x permission middleware does not yet support command-capable
     # backends. Keep shell safety on the backend boundary through workspace root
     # scoping, env redaction, and interrupt_on execute approvals.

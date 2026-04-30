@@ -21,7 +21,10 @@ import {
 } from "lucide-react";
 import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import { Link } from "react-router-dom";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
 
 import { FileTree } from "../components/FileTree";
 import { cn } from "../lib/utils";
@@ -1214,94 +1217,42 @@ function thinkingLineForEvent(event: StreamEvent): string | null {
   return null;
 }
 
-/** Matches ``` fences with optional lang; allows newline after opener to be optional (provider quirks). */
-const CODE_FENCE_RE = /```(?:[a-zA-Z0-9_-]*)?\s*\n?([\s\S]*?)```/g;
-
 type RichTextMode = "reflow" | "preserveLines";
 
 function renderTextWithCodeFences(text: string, mode: RichTextMode = "reflow") {
-  const nodes: ReactElement[] = [];
-  let lastIndex = 0;
-  let idx = 0;
-
-  for (const match of text.matchAll(CODE_FENCE_RE)) {
-    const full = match[0];
-    const code = match[1] ?? "";
-    const start = match.index ?? 0;
-
-    if (start > lastIndex) {
-      const slice = text.slice(lastIndex, start);
-      nodes.push(
-        <span key={`t-${idx++}`}>
-          {mode === "reflow"
-            ? renderMarkdownishText(slice, `m-${idx}`)
-            : renderMarkdownishPreserveLines(slice, `m-${idx}`)}
-        </span>,
-      );
-    }
-
-    nodes.push(
-      <pre key={`c-${idx++}`}>
-        {code.trimEnd()}
-      </pre>,
-    );
-
-    lastIndex = start + full.length;
-  }
-
-  if (lastIndex < text.length) {
-    const tail = text.slice(lastIndex);
-    nodes.push(
-      <span key={`t-${idx++}`}>
-        {mode === "reflow" ? renderMarkdownishText(tail, `m-${idx}`) : renderMarkdownishPreserveLines(tail, `m-${idx}`)}
-      </span>,
-    );
-  }
-
-  return <div className="timeline-rich-text">{nodes}</div>;
-}
-
-function renderMarkdownishText(raw: string, keyPrefix: string): ReactElement {
-  const lines = normalizeAndReflowText(raw);
-
+  const source = mode === "preserveLines" ? preserveSingleLineBreaks(text) : text;
   return (
-    <div className="rich-markdownish">
-      {lines.map((line, i) => (
-        <p key={`${keyPrefix}-${i}`}>{renderInlineBold(line, `${keyPrefix}-b-${i}`)}</p>
-      ))}
+    <div className="timeline-rich-text markdown-content">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        components={{
+          p: ({ children }) => <p>{children}</p>,
+          pre: ({ children }) => <pre>{children}</pre>,
+          code: ({ inline, children, className }) =>
+            inline ? (
+              <code className={`inline-code ${className ?? ""}`.trim()}>{children}</code>
+            ) : (
+              <code className={className}>{children}</code>
+            ),
+          table: ({ children }) => <table>{children}</table>,
+          thead: ({ children }) => <thead>{children}</thead>,
+          tbody: ({ children }) => <tbody>{children}</tbody>,
+          tr: ({ children }) => <tr>{children}</tr>,
+          th: ({ children }) => <th>{children}</th>,
+          td: ({ children }) => <td>{children}</td>,
+          ul: ({ children }) => <ul>{children}</ul>,
+          ol: ({ children }) => <ol>{children}</ol>,
+          li: ({ children }) => <li>{children}</li>,
+          h1: ({ children }) => <h1>{children}</h1>,
+          h2: ({ children }) => <h2>{children}</h2>,
+          h3: ({ children }) => <h3>{children}</h3>,
+          blockquote: ({ children }) => <blockquote>{children}</blockquote>,
+        }}
+      >
+        {source}
+      </ReactMarkdown>
     </div>
   );
-}
-
-/** Reasoning streams: keep model line breaks; do not merge into one paragraph. */
-function renderMarkdownishPreserveLines(raw: string, keyPrefix: string): ReactElement {
-  const normalized = raw.replace(/\r\n/g, "\n");
-  const lines = normalized.split("\n");
-
-  return (
-    <div className="rich-markdownish rich-markdownish-preserve">
-      {lines.map((line, i) => (
-        <p key={`${keyPrefix}-ln-${i}`}>
-          {line.length ? renderInlineBold(line, `${keyPrefix}-b-${i}`) : "\u00a0"}
-        </p>
-      ))}
-    </div>
-  );
-}
-
-function renderInlineBold(line: string, keyPrefix: string): Array<string | ReactElement> {
-  const parts: Array<string | ReactElement> = [];
-  const re = /\*\*(.+?)\*\*/g;
-  let last = 0;
-  let idx = 0;
-  for (const match of line.matchAll(re)) {
-    const start = match.index ?? 0;
-    if (start > last) parts.push(line.slice(last, start));
-    parts.push(<strong key={`${keyPrefix}-${idx++}`}>{match[1]}</strong>);
-    last = start + match[0].length;
-  }
-  if (last < line.length) parts.push(line.slice(last));
-  return parts.length ? parts : [line];
 }
 
 function extractThinkingAndToolsFromAssistantText(text: string): Array<{ id: string; kind: "tool" | "thinking" | "error"; text: string }> {
@@ -1411,34 +1362,10 @@ function deriveAgentTitle(prompt: string): string {
   return base.length > 34 ? `${base.slice(0, 34).trim()}...` : base;
 }
 
-function normalizeAndReflowText(raw: string): string[] {
-  const normalized = raw
+function preserveSingleLineBreaks(raw: string): string {
+  return raw
     .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .replace(/ +([.,!?;:])/g, "$1")
-    .replace(/([(\[{]) +/g, "$1")
-    .replace(/ +([)\]}])/g, "$1")
-    .replace(/ +'\s*/g, "'")
-    .trim();
-
-  const srcLines = normalized.split("\n").map((line) => line.trim()).filter(Boolean);
-  const out: string[] = [];
-  let current = "";
-
-  const flush = () => {
-    if (current.trim()) out.push(current.trim());
-    current = "";
-  };
-
-  for (const line of srcLines) {
-    const structural = /^[-*•]\s+/.test(line) || /^\d+[.)]\s+/.test(line) || /^#{1,6}\s+/.test(line);
-    if (structural) {
-      flush();
-      out.push(line);
-      continue;
-    }
-    current = current ? `${current} ${line}` : line;
-  }
-  flush();
-  return out;
+    .split("\n")
+    .map((line) => (line.trim().length ? `${line}  ` : ""))
+    .join("\n");
 }
