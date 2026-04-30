@@ -14,7 +14,7 @@ from ..core.dependencies import get_store
 from ..domain.models import InterruptDecision, RunStreamRequest
 from ..infra.security import validate_model
 from ..infra.session_store import SessionStore
-from ..services.streaming import stream_run
+from ..services.streaming import stream_run, submit_interrupt_decision
 
 router = APIRouter(prefix="/api", tags=["runs"])
 
@@ -75,6 +75,7 @@ def decide_interrupt(
     store: SessionStore = Depends(get_store),
 ) -> dict:
     approval = store.decide_interrupt(run_id, interrupt_id, payload.decision)
+    submit_interrupt_decision(run_id, interrupt_id, payload.decision)
     return approval.model_dump(mode="json", by_alias=True)
 
 

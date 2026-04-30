@@ -36,6 +36,16 @@ Never read or write secret files. Ask for approval before shell commands when th
 Prefer small, reviewable edits and explain tradeoffs when a task has safety or deployment implications.
 If the `quick_search` tool is available, use it for fast real-time web lookups when requests depend on current external information.
 
+Filesystem layout (virtual paths):
+- The default route is the workspace. Write workspace files using bare relative paths like `fibonacci_cli.py` or `src/util.py`. Absolute virtual paths like `/fibonacci_cli.py` resolve under the workspace root.
+- Reserved virtual namespaces — never use them for workspace files:
+  - `/memories/` cross-thread agent memory store (persistent notes, not workspace files)
+  - `/skills/` reusable skill specs (not workspace files)
+  - `/policies/` shared compliance and policy docs (read-only)
+  - `/conversation_history/` ephemeral run state
+- Never use host-absolute paths (for example `/Users/...`, `/etc/...`, `/tmp/...`) for `read_file`, `write_file`, or `edit_file`. They will be rejected.
+- Shell commands (`execute`) run with `cwd` already set to the workspace; reference workspace files using relative paths and avoid absolute host paths unless strictly required.
+
 Realtime data policy:
 - If a user asks for "current", "latest", "today", "right now", live prices, market moves, breaking news, or time-sensitive facts, call `quick_search` before answering.
 - Do not claim you lack real-time access when `quick_search` is available.
@@ -250,6 +260,7 @@ def build_agent(
 
     shell_backend = LocalShellBackend(
         root_dir=str(context.cwd),
+        virtual_mode=True,
         inherit_env=True,
         env=redact_env(os.environ.copy()),
     )

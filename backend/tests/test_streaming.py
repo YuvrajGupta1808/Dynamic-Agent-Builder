@@ -3,7 +3,13 @@ from pathlib import Path
 from agent_workbench.domain.models import ChatMessage, RunStreamRequest, SessionRecord
 from agent_workbench.infra.deep_agent_resources import ensure_session_store_seeded, get_langgraph_store
 from agent_workbench.infra.session_store import SessionStore
-from agent_workbench.services.streaming import EventSequencer, messages_for_agent_run, normalize_chunk, stream_run
+from agent_workbench.services.streaming import (
+    EventSequencer,
+    InterruptDecisionBroker,
+    messages_for_agent_run,
+    normalize_chunk,
+    stream_run,
+)
 
 
 def test_normalize_token_chunk(tmp_path: Path) -> None:
@@ -116,6 +122,44 @@ def test_approval_event_creates_interrupt(tmp_path: Path) -> None:
     )
     assert events[0].type == "approval_required"
     assert events[0].data["tool"] == "execute"
+
+
+def test_updates_interrupt_variant_emits_approval_required(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    sequencer = EventSequencer("run-1", "session-1")
+    events = normalize_chunk(
+        {
+            "type": "updates",
+            "ns": (),
+            "data": {
+                "__interrupt__": [
+                    {
+                        "value": {
+                            "action_requests": [
+                                {"name": "execute", "args": {"command": "pwd", "cwd": "/workspace"}}
+                            ]
+                        }
+                    }
+                ]
+            },
+            "_workbench_interrupts": [
+                {"interruptId": "intr-1", "tool": "execute", "payload": {"command": "pwd", "cwd": "/workspace"}}
+            ],
+        },
+        sequencer,
+        store,
+    )
+    assert any(event.type == "approval_required" for event in events)
+    approval = next(event for event in events if event.type == "approval_required")
+    assert approval.data["interruptId"] == "intr-1"
+    assert approval.data["tool"] == "execute"
+
+
+def test_interrupt_decision_broker_waits_for_decision() -> None:
+    broker = InterruptDecisionBroker()
+    broker.register("run-1", "intr-1")
+    assert broker.publish("run-1", "intr-1", "approve") is True
+    assert broker.wait_for("run-1", "intr-1", timeout_seconds=1.0) == "approve"
 
 
 def test_messages_for_agent_run_prefers_messages_list() -> None:

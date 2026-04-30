@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -10,6 +11,8 @@ from collections.abc import Generator, Iterable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from langgraph.types import Command
 
 from ..domain.agents import AgentSessionContext, build_agent
 from ..domain.models import ApprovalRecord, RunStreamRequest, SessionRecord, StreamEvent
@@ -20,8 +23,67 @@ MAX_RUN_MESSAGES = 64
 MAX_MESSAGE_CHARS = 120_000
 
 
-def messages_for_agent_run(request: RunStreamRequest) -> list[dict[str, Any]]:
-    """LangChain-compatible chat turns for the Deep Agent graph (multi-turn)."""
+class InterruptDecisionBroker:
+    """In-memory bridge between interrupt decisions API and active stream workers."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._pending: dict[tuple[str, str], None] = {}
+        self._decisions: dict[tuple[str, str], str] = {}
+
+    def register(self, run_id: str, interrupt_id: str) -> None:
+        with self._cond:
+            self._pending[(run_id, interrupt_id)] = None
+            self._cond.notify_all()
+
+    def publish(self, run_id: str, interrupt_id: str, decision: str) -> bool:
+        with self._cond:
+            key = (run_id, interrupt_id)
+            self._decisions[key] = decision
+            self._cond.notify_all()
+            return key in self._pending
+
+    def wait_for(self, run_id: str, interrupt_id: str, timeout_seconds: float) -> str | None:
+        key = (run_id, interrupt_id)
+        deadline = time.monotonic() + max(timeout_seconds, 1.0)
+        with self._cond:
+            while True:
+                decision = self._decisions.pop(key, None)
+                if decision is not None:
+                    self._pending.pop(key, None)
+                    return decision
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(timeout=remaining)
+
+    def clear_run(self, run_id: str) -> None:
+        with self._cond:
+            pending_keys = [key for key in self._pending if key[0] == run_id]
+            for key in pending_keys:
+                self._pending.pop(key, None)
+                self._decisions.pop(key, None)
+
+
+INTERRUPT_BROKER = InterruptDecisionBroker()
+
+
+def submit_interrupt_decision(run_id: str, interrupt_id: str, decision: str) -> bool:
+    """Publish user approval/rejection to an active stream worker."""
+    return INTERRUPT_BROKER.publish(run_id, interrupt_id, decision)
+
+
+def messages_for_agent_run(
+    request: RunStreamRequest,
+    *,
+    workspace_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """LangChain-compatible chat turns for the Deep Agent graph (multi-turn).
+
+    When ``workspace_name`` is provided, a single-line system note is prepended
+    so the agent does not need to call ``pwd`` to discover its workspace.
+    Only the human-readable workspace name is exposed; never the host path.
+    """
     if request.messages is not None and len(request.messages) > 0:
         trimmed = request.messages[-MAX_RUN_MESSAGES:]
         formatted: list[dict[str, Any]] = []
@@ -47,8 +109,24 @@ def messages_for_agent_run(request: RunStreamRequest) -> list[dict[str, Any]]:
             else:
                 normalized_content = ""
             formatted.append({"role": message.role, "content": normalized_content})
+        if workspace_name:
+            formatted.insert(0, _workspace_context_message(workspace_name))
         return formatted
-    return [{"role": "user", "content": (request.message or "")[:MAX_MESSAGE_CHARS]}]
+    base = [{"role": "user", "content": (request.message or "")[:MAX_MESSAGE_CHARS]}]
+    if workspace_name:
+        base.insert(0, _workspace_context_message(workspace_name))
+    return base
+
+
+def _workspace_context_message(workspace_name: str) -> dict[str, Any]:
+    return {
+        "role": "system",
+        "content": (
+            f"Workspace cwd: {workspace_name} (virtual root). "
+            "Filesystem tools resolve relative paths under this workspace; "
+            "do not call pwd or use host-absolute paths to write workspace files."
+        ),
+    }
 
 
 class EventSequencer:
@@ -204,6 +282,109 @@ def _iter_messages_from_update(update_payload: Any) -> list[Any]:
     return messages
 
 
+def _collect_interrupt_payloads(value: Any) -> list[Any]:
+    payloads: list[Any] = []
+    if isinstance(value, dict):
+        if "__interrupt__" in value:
+            raw = value.get("__interrupt__")
+            if isinstance(raw, (list, tuple)):
+                payloads.extend(list(raw))
+            elif raw is not None:
+                payloads.append(raw)
+        for child in value.values():
+            payloads.extend(_collect_interrupt_payloads(child))
+        return payloads
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            payloads.extend(_collect_interrupt_payloads(item))
+    return payloads
+
+
+def _interrupt_payload_to_tool_and_args(raw_interrupt: Any) -> tuple[str, dict[str, Any]]:
+    # LangGraph interrupt objects often carry a `.value`; convert to plain data.
+    interrupt_value = getattr(raw_interrupt, "value", raw_interrupt)
+    if isinstance(interrupt_value, dict):
+        action_requests = interrupt_value.get("action_requests")
+        if isinstance(action_requests, list) and action_requests:
+            first = action_requests[0]
+            if isinstance(first, dict):
+                tool_name = str(first.get("name") or "execute")
+                args = first.get("args")
+                if isinstance(args, dict):
+                    return tool_name, dict(args)
+                return tool_name, {"rawArgs": _safe_data(args)}
+        tool = str(interrupt_value.get("tool") or "execute")
+        payload = interrupt_value.get("payload")
+        if isinstance(payload, dict):
+            return tool, payload
+    return "execute", {"rawInterrupt": _safe_data(interrupt_value)}
+
+
+# Read-only shell commands that are safe to auto-approve when the workbench is
+# running in `accept_edits` mode. The default set covers harmless probes the
+# agent would otherwise gate on (`pwd`, `ls`, `cat`, version checks). Operators
+# can override via the WORKBENCH_EXECUTE_SAFELIST env var (comma-separated;
+# entries match either the full command or the leading program token). Set the
+# env var to an empty string to disable the safelist entirely.
+_DEFAULT_EXECUTE_SAFELIST: frozenset[str] = frozenset(
+    {
+        "pwd",
+        "ls",
+        "cat",
+        "which",
+        "python -V",
+        "python --version",
+        "python3 -V",
+        "python3 --version",
+    }
+)
+
+
+def _execute_safelist() -> set[str]:
+    raw = os.getenv("WORKBENCH_EXECUTE_SAFELIST")
+    if raw is None:
+        return set(_DEFAULT_EXECUTE_SAFELIST)
+    return {token.strip() for token in raw.split(",") if token.strip()}
+
+
+def _can_auto_approve(tool: str, payload: dict[str, Any]) -> bool:
+    if tool != "execute":
+        return False
+    safelist = _execute_safelist()
+    if not safelist:
+        return False
+    command = str(payload.get("command") or payload.get("cmd") or "").strip()
+    if not command:
+        return False
+    if command in safelist:
+        return True
+    program = command.split()[0]
+    return program in safelist
+
+
+def _attach_interrupts_to_chunk(chunk: Any) -> tuple[Any, list[dict[str, Any]]]:
+    if not isinstance(chunk, dict):
+        return chunk, []
+    raw_interrupts = _collect_interrupt_payloads(chunk)
+    if not raw_interrupts:
+        return chunk, []
+    prepared: list[dict[str, Any]] = []
+    for raw in raw_interrupts:
+        tool, payload = _interrupt_payload_to_tool_and_args(raw)
+        prepared.append(
+            {
+                "interruptId": uuid4().hex,
+                "tool": tool,
+                "payload": payload,
+                "rawInterrupt": _safe_data(getattr(raw, "value", raw)),
+                "autoApprove": _can_auto_approve(tool, payload),
+            }
+        )
+    enriched_chunk = dict(chunk)
+    enriched_chunk["_workbench_interrupts"] = prepared
+    return enriched_chunk, prepared
+
+
 def normalize_chunk(
     chunk: Any,
     sequencer: EventSequencer,
@@ -219,6 +400,47 @@ def normalize_chunk(
     source = _source_from_ns(ns)
     data = chunk.get("data")
     events: list[StreamEvent] = []
+    injected_interrupts = chunk.get("_workbench_interrupts")
+    if isinstance(injected_interrupts, list) and injected_interrupts:
+        for pending in injected_interrupts:
+            if not isinstance(pending, dict):
+                continue
+            interrupt_id = str(pending.get("interruptId") or uuid4().hex)
+            tool = str(pending.get("tool") or "execute")
+            payload = dict(pending.get("payload") or {})
+            if pending.get("rawInterrupt") is not None:
+                payload.setdefault("_rawInterrupt", pending.get("rawInterrupt"))
+            if pending.get("autoApprove"):
+                command_preview = str(payload.get("command") or payload.get("cmd") or "")[:200]
+                events.append(
+                    sequencer.event(
+                        "update",
+                        source=source,
+                        message=f"Auto-approved safe shell command: {command_preview}".rstrip(": "),
+                        data={
+                            "event": "auto_approved",
+                            "tool": tool,
+                            "interruptId": interrupt_id,
+                            "command": command_preview,
+                        },
+                    )
+                )
+                continue
+            approval = ApprovalRecord(
+                runId=sequencer.run_id,
+                interruptId=interrupt_id,
+                tool=tool,
+                payload=payload,
+            )
+            store.create_interrupt(approval)
+            events.append(
+                sequencer.event(
+                    "approval_required",
+                    source=source,
+                    message=f"Approval required for {approval.tool}",
+                    data=approval.model_dump(mode="json", by_alias=True),
+                )
+            )
 
     if chunk_type == "messages" and isinstance(data, tuple) and data:
         token = data[0]
@@ -298,7 +520,7 @@ def normalize_chunk(
         elif custom_event == "file_change":
             events.append(sequencer.event("file_change", source=source, message=data.get("summary"), data=data))
         elif custom_event == "approval_required":
-            interrupt_id = uuid4().hex
+            interrupt_id = str(data.get("interruptId") or uuid4().hex)
             approval = ApprovalRecord(
                 runId=sequencer.run_id,
                 interruptId=interrupt_id,
@@ -318,6 +540,8 @@ def normalize_chunk(
             events.append(sequencer.event("custom", source=source, message=data.get("status") or "Custom event", data=data))
         return events
 
+    if events:
+        return events
     return [sequencer.event("custom", source=source, message="Unhandled stream chunk", data={"chunk": _safe_data(chunk)})]
 
 
@@ -361,7 +585,7 @@ def stream_run(
     try:
         ensure_session_store_seeded(get_langgraph_store(), session.id)
         agent = build_agent(context)
-        stream_messages = messages_for_agent_run(request)
+        stream_messages = messages_for_agent_run(request, workspace_name=context.cwd.name)
         saw_assistant_token = False
         last_reasoning_message = ""
         chunk_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -376,25 +600,65 @@ def stream_run(
         def _pump_chunks() -> None:
             nonlocal updates_only_stream_mode
             try:
-                chunks: Iterable[Any]
-                try:
-                    chunks = agent.stream(
-                        {"messages": stream_messages},
-                        stream_mode=["updates", "messages", "custom"],
-                        subgraphs=True,
-                        version="v2",
-                        config={"configurable": {"thread_id": session.id}},
-                    )
-                except TypeError:
-                    updates_only_stream_mode = True
-                    chunks = agent.stream(
-                        {"messages": stream_messages},
-                        stream_mode="updates",
-                        subgraphs=True,
-                        version="v2",
-                    )
-                for chunk in chunks:
-                    chunk_queue.put(("chunk", chunk))
+                next_input: Any = {"messages": stream_messages}
+                while True:
+                    chunks: Iterable[Any]
+                    try:
+                        chunks = agent.stream(
+                            next_input,
+                            stream_mode=["updates", "messages", "custom"],
+                            subgraphs=True,
+                            version="v2",
+                            config={"configurable": {"thread_id": session.id}},
+                        )
+                    except TypeError:
+                        updates_only_stream_mode = True
+                        chunks = agent.stream(
+                            next_input,
+                            stream_mode="updates",
+                            subgraphs=True,
+                            version="v2",
+                        )
+                    saw_interrupt = False
+                    interrupt_decisions: list[dict[str, Any]] = []
+                    for chunk in chunks:
+                        enriched_chunk, interrupts = _attach_interrupts_to_chunk(chunk)
+                        for pending in interrupts:
+                            if pending.get("autoApprove"):
+                                continue
+                            interrupt_id = str(pending.get("interruptId") or "")
+                            if not interrupt_id:
+                                continue
+                            INTERRUPT_BROKER.register(run_id, interrupt_id)
+                        chunk_queue.put(("chunk", enriched_chunk))
+                        if not interrupts:
+                            continue
+                        saw_interrupt = True
+                        for pending in interrupts:
+                            if pending.get("autoApprove"):
+                                interrupt_decisions.append({"type": "approve"})
+                                continue
+                            interrupt_id = str(pending.get("interruptId") or "")
+                            if not interrupt_id:
+                                continue
+                            decision = INTERRUPT_BROKER.wait_for(
+                                run_id,
+                                interrupt_id,
+                                timeout_seconds=float(max(command_timeout_seconds, 30)),
+                            )
+                            if decision is None:
+                                raise TimeoutError(
+                                    f"Timed out waiting for approval decision for interrupt {interrupt_id}."
+                                )
+                            if decision == "approve":
+                                interrupt_decisions.append({"type": "approve"})
+                            else:
+                                interrupt_decisions.append(
+                                    {"type": "reject", "message": "User rejected this tool execution request."}
+                                )
+                    if not saw_interrupt:
+                        break
+                    next_input = Command(resume={"decisions": interrupt_decisions})
                 chunk_queue.put(("done", None))
             except Exception as exc:  # pragma: no cover - exercised in integration runs
                 chunk_queue.put(("error", exc))
@@ -454,3 +718,5 @@ def stream_run(
     except Exception as exc:
         yield to_sse(sequencer.event("error", message=str(exc), data={"errorType": type(exc).__name__}))
         store.finish_run(run_id, "error")
+    finally:
+        INTERRUPT_BROKER.clear_run(run_id)
