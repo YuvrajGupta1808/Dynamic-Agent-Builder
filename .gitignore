@@ -16,3 +16,4 @@ apps/web/*.d.ts
 apps/web/*.js
 .venv/
 venv/
+backend/uv.lock
