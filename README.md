@@ -6,7 +6,7 @@ Local Deep Coding Agent Workbench is a localhost-only coding agent UI with a Fas
 
 ```bash
 cp .env.example .env
-.venv/bin/python --version >/dev/null 2>&1 || python3 -m venv .venv
+.venv/bin/python --version >/dev/null 2>&1 || python3.12 -m venv .venv
 .venv/bin/python -m pip install -U pip
 .venv/bin/python -m pip install -e "backend[deepagents,test]"
 pnpm install
