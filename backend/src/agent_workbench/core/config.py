@@ -57,7 +57,7 @@ def _ollama_models() -> tuple[str, ...]:
 
 
 def _default_model() -> str:
-    return "openai:accounts/fireworks/models/qwen3p6-plus"
+    return os.getenv("WORKBENCH_DEFAULT_MODEL", "openai:accounts/fireworks/models/qwen3p6-plus")
 
 
 @dataclass(frozen=True)
