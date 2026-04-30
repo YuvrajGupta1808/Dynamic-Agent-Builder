@@ -8,21 +8,21 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..infra.security import redact_env
+from .fireworks_openai import FireworksReasoningChatOpenAI
 from .models import SessionMode, WorkspaceMode
 
 try:  # Optional: the app runs in mock mode without these packages.
     from deepagents import FilesystemPermission, create_deep_agent
-    from deepagents.backends import CompositeBackend, LocalShellBackend, StateBackend
+    from deepagents.backends import CompositeBackend, LocalShellBackend, StateBackend, StoreBackend
     from langchain_openai import ChatOpenAI
-    from langgraph.checkpoint.memory import MemorySaver
 except Exception:  # pragma: no cover - exercised in environments without deepagents
     FilesystemPermission = None  # type: ignore[assignment]
     create_deep_agent = None  # type: ignore[assignment]
     CompositeBackend = None  # type: ignore[assignment]
     LocalShellBackend = None  # type: ignore[assignment]
     StateBackend = None  # type: ignore[assignment]
+    StoreBackend = None  # type: ignore[assignment]
     ChatOpenAI = None  # type: ignore[assignment]
-    MemorySaver = None  # type: ignore[assignment]
 
 
 SYSTEM_PROMPT = """You are a production coding agent running in a local workbench.
@@ -175,11 +175,18 @@ def _permissions() -> list[Any]:
         FilesystemPermission(operations=["read", "write"], paths=["/workspace/.env", "/workspace/.env.*"], mode="deny"),
         FilesystemPermission(operations=["read", "write"], paths=["/workspace/**"], mode="allow"),
         FilesystemPermission(operations=["read", "write"], paths=["/memories/**"], mode="allow"),
+        FilesystemPermission(operations=["read", "write"], paths=["/skills/**"], mode="allow"),
+        FilesystemPermission(operations=["write"], paths=["/policies/**"], mode="deny"),
         FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny"),
     ]
 
 
-def build_agent(context: AgentSessionContext) -> Any:
+def build_agent(
+    context: AgentSessionContext,
+    *,
+    checkpointer: Any | None = None,
+    store: Any | None = None,
+) -> Any:
     """Build a Deep Agent when installed, otherwise a deterministic mock agent."""
 
     if context.model.startswith("mock:") or create_deep_agent is None:
@@ -199,25 +206,44 @@ def build_agent(context: AgentSessionContext) -> Any:
     assert StateBackend is not None
     assert LocalShellBackend is not None
     assert CompositeBackend is not None
+    assert StoreBackend is not None
 
-    ephemeral_backend = StateBackend()
+    from ..infra.deep_agent_resources import get_checkpointer, get_langgraph_store
+
+    resolved_checkpointer = checkpointer if checkpointer is not None else get_checkpointer()
+    resolved_store = store if store is not None else get_langgraph_store()
+
     shell_backend = LocalShellBackend(
         root_dir=str(context.cwd),
         inherit_env=True,
         env=redact_env(os.environ.copy()),
     )
+    ephemeral_backend = StateBackend()
+    session_ns = context.session_id
+
+    # Pass a CompositeBackend instance (not a factory). MemoryMiddleware resolves callable
+    # backends by synthesizing ToolRuntime and omits required fields on current langchain.
     backend = CompositeBackend(
         default=shell_backend,
         routes={
-            "/memories/": StateBackend(),
+            "/memories/": StoreBackend(
+                store=resolved_store,
+                namespace=lambda _rt: (session_ns,),
+            ),
+            "/skills/": StoreBackend(
+                store=resolved_store,
+                namespace=lambda _rt: (session_ns,),
+            ),
+            "/policies/": StoreBackend(
+                store=resolved_store,
+                namespace=lambda _rt: ("workbench",),
+            ),
             "/conversation_history/": ephemeral_backend,
         },
     )
-    checkpointer = MemorySaver() if MemorySaver is not None else None
+
     model: Any = context.model
     if context.model.startswith("openai:") and ChatOpenAI is not None:
-        # Use an explicit OpenAI-compatible client to bound retries/timeouts and
-        # avoid indefinite hangs in upstream model calls.
         openai_model = context.model.split("openai:", 1)[1]
         chat_kwargs: dict[str, Any] = {
             "model": openai_model,
@@ -226,15 +252,9 @@ def build_agent(context: AgentSessionContext) -> Any:
         }
         if "accounts/fireworks/models/" in context.model:
             chat_kwargs["base_url"] = os.getenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
-        # Fireworks Qwen 3.6 Plus emits reasoning_content natively, but
-        # langchain-openai chat-completions parsing may drop it. Responses API
-        # with responses/v1 output keeps reasoning blocks available for stream
-        # normalization and UI rendering.
-        if "accounts/fireworks/models/qwen3p6-plus" in context.model:
-            chat_kwargs["use_responses_api"] = True
-            chat_kwargs["output_version"] = "responses/v1"
-            chat_kwargs["reasoning_effort"] = "low"
-        model = ChatOpenAI(**chat_kwargs)
+            model = FireworksReasoningChatOpenAI(**chat_kwargs)
+        else:
+            model = ChatOpenAI(**chat_kwargs)
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -242,12 +262,17 @@ def build_agent(context: AgentSessionContext) -> Any:
         "backend": backend,
         "interrupt_on": get_interrupt_config(context.mode),
         "subagents": SUBAGENTS,
+        "memory": [
+            "/memories/WORKBENCH.md",
+            "/policies/compliance.md",
+        ],
+        "skills": ["/skills/"],
+        "store": resolved_store,
+        "checkpointer": resolved_checkpointer,
     }
     # Deep Agents 0.5.x permission middleware does not yet support command-capable
     # backends. Keep shell safety on the backend boundary through workspace root
     # scoping, env redaction, and interrupt_on execute approvals.
     if os.getenv("WORKBENCH_ENABLE_DEEPAGENTS_PERMISSIONS") == "true":
         kwargs["permissions"] = _permissions()
-    if checkpointer is not None:
-        kwargs["checkpointer"] = checkpointer
     return create_deep_agent(**kwargs)
