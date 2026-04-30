@@ -13,6 +13,7 @@ export interface AppConfig {
   workspaceRoot: string;
   currentWorkingDirectory: string;
   tokenRequired: boolean;
+  clerkAuthEnabled?: boolean;
 }
 
 export interface WorkspaceSummary {

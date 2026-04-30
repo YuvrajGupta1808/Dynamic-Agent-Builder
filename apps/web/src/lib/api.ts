@@ -10,45 +10,36 @@ import type {
   WorkspaceSummary,
   WorkspaceMode,
 } from "../types/api";
+import { isClerkJwtRequired, resetLegacyWorkbenchToken, resolveApiToken } from "./auth-token";
 import { parseSseFrames } from "./sse";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
-const TOKEN_KEY = "agent-workbench-token";
-const DEFAULT_TOKEN = import.meta.env.VITE_WORKBENCH_TOKEN ?? "dev-local-token";
 
-export function getToken() {
-  const existing = localStorage.getItem(TOKEN_KEY);
-  if (existing) return existing;
-  localStorage.setItem(TOKEN_KEY, DEFAULT_TOKEN);
-  return DEFAULT_TOKEN;
-}
 
-export function setToken(token: string) {
-  localStorage.setItem(TOKEN_KEY, token);
-}
-
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const doFetch = async (token: string) =>
+async function fetchWithAutoTokenReset(path: string, init?: RequestInit): Promise<Response> {
+  const clerkStrict = isClerkJwtRequired();
+  const token = await resolveApiToken();
+  const doFetch = (bearer: string) =>
     fetch(`${API_BASE}${path}`, {
       ...init,
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${bearer}`,
         ...(init?.headers ?? {}),
       },
     });
 
-  let response: Response;
-  try {
-    response = await doFetch(getToken());
-  } catch (err) {
-    throw new Error(`API unreachable at ${API_BASE}`);
+  let response = await doFetch(token);
+  if (!clerkStrict && response.status === 401) {
+    // Recover from stale localStorage tokens by retrying once with the default dev token.
+    const fallback = resetLegacyWorkbenchToken();
+    response = await doFetch(fallback);
   }
+  return response;
+}
 
-  if (response.status === 401) {
-    setToken(DEFAULT_TOKEN);
-    response = await doFetch(DEFAULT_TOKEN);
-  }
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetchWithAutoTokenReset(path, init);
 
   if (!response.ok) {
     const text = await response.text();
@@ -124,7 +115,6 @@ export async function streamRun(
   payload: { message: string; messages?: ChatTurn[]; model?: string; mode?: SessionMode },
   onEvent: (event: StreamEvent) => void,
 ) {
-  // Backend stall guard can exceed 120s without tokens; keep above that plus buffer.
   const STREAM_TIMEOUT_MS = 210_000;
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   const resetTimeout = (controller: AbortController) => {
@@ -133,33 +123,12 @@ export async function streamRun(
   };
 
   const controller = new AbortController();
-  const doFetch = async (token: string) =>
-    fetch(`${API_BASE}/api/sessions/${sessionId}/runs/stream`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
 
-  let response: Response;
-  try {
-    resetTimeout(controller);
-    response = await doFetch(getToken());
-  } catch {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    if (controller.signal.aborted) {
-      throw new Error("Run timed out waiting for backend stream");
-    }
-    throw new Error(`API unreachable at ${API_BASE}`);
-  }
-  if (response.status === 401) {
-    setToken(DEFAULT_TOKEN);
-    resetTimeout(controller);
-    response = await doFetch(DEFAULT_TOKEN);
-  }
+  const response = await fetchWithAutoTokenReset(`/api/sessions/${sessionId}/runs/stream`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+    signal: controller.signal,
+  });
 
   if (!response.ok || !response.body) {
     if (timeoutHandle) clearTimeout(timeoutHandle);
