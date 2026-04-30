@@ -1219,6 +1219,21 @@ p,
   margin-bottom: 2px;
 }
 
+.timeline-inline-images {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.timeline-inline-image {
+  width: 120px;
+  height: 120px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid hsl(220 10% 24%);
+}
+
 .timeline-card.thinking {
   border: 0;
   background: transparent;
@@ -1310,6 +1325,43 @@ p,
   display: none;
   width: 0;
   height: 0;
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.composer-attachment-chip {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid hsl(220 10% 26%);
+}
+
+.composer-attachment-chip img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.composer-attachment-chip button {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 999px;
+  background: hsl(0 0% 0% / 0.65);
+  color: hsl(0 0% 100%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
 }
 
 .agent-textarea {

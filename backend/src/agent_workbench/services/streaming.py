@@ -20,14 +20,34 @@ MAX_RUN_MESSAGES = 64
 MAX_MESSAGE_CHARS = 120_000
 
 
-def messages_for_agent_run(request: RunStreamRequest) -> list[dict[str, str]]:
+def messages_for_agent_run(request: RunStreamRequest) -> list[dict[str, Any]]:
     """LangChain-compatible chat turns for the Deep Agent graph (multi-turn)."""
     if request.messages is not None and len(request.messages) > 0:
         trimmed = request.messages[-MAX_RUN_MESSAGES:]
-        return [
-            {"role": m.role, "content": (m.content or "")[:MAX_MESSAGE_CHARS]}
-            for m in trimmed
-        ]
+        formatted: list[dict[str, Any]] = []
+        for message in trimmed:
+            content = message.content
+            if isinstance(content, str):
+                normalized_content: str | list[dict[str, Any]] = content[:MAX_MESSAGE_CHARS]
+            elif isinstance(content, list):
+                normalized_content = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = str(block.get("type") or "")
+                    if block_type == "text":
+                        text = str(block.get("text") or "")
+                        normalized_content.append({"type": "text", "text": text[:MAX_MESSAGE_CHARS]})
+                    elif block_type == "image_url":
+                        image_url = block.get("image_url")
+                        if isinstance(image_url, dict):
+                            normalized_content.append({"type": "image_url", "image_url": {"url": str(image_url.get("url") or "")}})
+                if not normalized_content:
+                    normalized_content = [{"type": "text", "text": ""}]
+            else:
+                normalized_content = ""
+            formatted.append({"role": message.role, "content": normalized_content})
+        return formatted
     return [{"role": "user", "content": (request.message or "")[:MAX_MESSAGE_CHARS]}]
 
 

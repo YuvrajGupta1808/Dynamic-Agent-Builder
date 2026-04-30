@@ -43,7 +43,7 @@ class SessionRecord(StrictModel):
 
 class ChatMessage(StrictModel):
     role: Literal["user", "assistant", "system"]
-    content: str = Field(default="", max_length=200_000)
+    content: str | list[dict[str, Any]] = Field(default="")
 
 
 class RunStreamRequest(StrictModel):

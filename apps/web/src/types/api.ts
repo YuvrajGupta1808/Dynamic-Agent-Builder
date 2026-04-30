@@ -1,8 +1,10 @@
 export type WorkspaceMode = "local" | "uploaded" | "remote_sandbox";
 export type SessionMode = "ask_before_edits" | "accept_edits" | "accept_everything";
 
+export type ChatContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+
 /** One chat turn for multi-turn agent runs (matches backend `ChatMessage`). */
-export type ChatTurn = { role: "user" | "assistant" | "system"; content: string };
+export type ChatTurn = { role: "user" | "assistant" | "system"; content: string | ChatContentPart[] };
 
 export interface AppConfig {
   defaultModel: string;

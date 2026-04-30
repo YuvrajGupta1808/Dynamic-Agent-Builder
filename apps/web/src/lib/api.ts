@@ -162,3 +162,30 @@ export async function streamRun(
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 }
+
+export async function transcribeAudio(file: Blob, model = "whisper-v3-turbo"): Promise<{ text: string }> {
+  const clerkStrict = isClerkJwtRequired();
+  const token = await resolveApiToken();
+  const form = new FormData();
+  form.append("file", file, "recording.webm");
+  form.append("model", model);
+  const doFetch = (bearer: string) =>
+    fetch(`${API_BASE}/api/audio/transcriptions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+      },
+      body: form,
+    });
+
+  let response = await doFetch(token);
+  if (!clerkStrict && response.status === 401) {
+    const fallback = resetLegacyWorkbenchToken();
+    response = await doFetch(fallback);
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || response.statusText);
+  }
+  return (await response.json()) as { text: string };
+}

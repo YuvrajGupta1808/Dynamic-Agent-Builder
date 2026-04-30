@@ -16,12 +16,13 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Square,
   SquareTerminal,
   X,
 } from "lucide-react";
 import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import { Link } from "react-router-dom";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
@@ -40,11 +41,13 @@ import {
   getFileTree,
   getWorkspaces,
   streamRun,
+  transcribeAudio,
 } from "../lib/api";
 import { setRequireClerkJwt } from "../lib/auth-token";
 import type {
   AppConfig,
   ApprovalData,
+  ChatContentPart,
   FileTreeNode,
   SessionRecord,
   StreamEvent,
@@ -61,8 +64,14 @@ export function WorkbenchPage() {
   type CompletedRun = {
     id: string;
     prompt: string;
+    promptImages: string[];
     thinkingItems: ThinkingItem[];
     finalOutput: string;
+  };
+  type ImageAttachment = {
+    id: string;
+    name: string;
+    dataUrl: string;
   };
   type ChatThread = {
     id: string;
@@ -98,6 +107,9 @@ export function WorkbenchPage() {
   const [recentPrompts, setRecentPrompts] = useState<string[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [showActions, setShowActions] = useState(false);
+  const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([{ id: crypto.randomUUID(), title: "Agents", runs: [] }]);
   const [activeThreadId, setActiveThreadId] = useState<string>("");
   const activeThread = chatThreads.find((thread) => thread.id === activeThreadId) ?? chatThreads[0];
@@ -110,6 +122,9 @@ export function WorkbenchPage() {
   const chatPaneRef = useRef<HTMLDivElement>(null);
   const terminalOutputRef = useRef<HTMLPreElement>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaChunksRef = useRef<BlobPart[]>([]);
   const explorerPanelRef = usePanelRef();
   const chatPanelRef = usePanelRef();
   const terminalPanelRef = usePanelRef();
@@ -336,7 +351,7 @@ export function WorkbenchPage() {
       return;
     }
     const userPrompt = prompt.trim();
-    if (!userPrompt) return;
+    if (!userPrompt && imageAttachments.length === 0) return;
     runInFlightRef.current = true;
     let threadIdAtSend = activeThreadId || chatThreads[0]?.id || "";
     if (!threadIdAtSend) {
@@ -345,11 +360,15 @@ export function WorkbenchPage() {
       setActiveThreadId(threadIdAtSend);
     }
     setPrompt("");
+    const activeImageAttachments = imageAttachments;
+    setImageAttachments([]);
     setIsRunning(true);
-    setLastSubmittedPrompt(userPrompt);
+    setLastSubmittedPrompt(userPrompt || (imageAttachments.length ? "Sent image attachment(s)" : ""));
     const provisionalTitle = deriveAgentTitle(userPrompt);
     setAgentTitle(provisionalTitle);
-    setRecentPrompts((current) => [userPrompt, ...current.filter((p) => p !== userPrompt)].slice(0, 8));
+    if (userPrompt) {
+      setRecentPrompts((current) => [userPrompt, ...current.filter((p) => p !== userPrompt)].slice(0, 8));
+    }
     setError(null);
     setFinalOutput("");
     setThinkingItems([]);
@@ -375,14 +394,29 @@ export function WorkbenchPage() {
         ),
       );
       const transcriptMessages = priorRuns.flatMap((r) => [
-        { role: "user" as const, content: r.prompt },
+        {
+          role: "user" as const,
+          content:
+            r.promptImages.length > 0
+              ? ([{ type: "text", text: r.prompt }, ...r.promptImages.map((url) => ({ type: "image_url", image_url: { url } }))] as ChatContentPart[])
+              : r.prompt,
+        },
         { role: "assistant" as const, content: r.finalOutput },
       ]);
+      const currentUserContent: string | ChatContentPart[] =
+        activeImageAttachments.length > 0
+          ? [
+              { type: "text", text: userPrompt },
+              ...activeImageAttachments.map(
+                (item): ChatContentPart => ({ type: "image_url", image_url: { url: item.dataUrl } }),
+              ),
+            ]
+          : userPrompt;
       await streamRun(
         sessionId,
         {
           message: userPrompt,
-          messages: [...transcriptMessages, { role: "user", content: userPrompt }],
+          messages: [...transcriptMessages, { role: "user", content: currentUserContent }],
           model: activeModel,
           mode: "accept_edits",
         },
@@ -509,6 +543,7 @@ export function WorkbenchPage() {
         const completed: CompletedRun = {
           id: crypto.randomUUID(),
           prompt: userPrompt,
+          promptImages: activeImageAttachments.map((item) => item.dataUrl),
           thinkingItems: liveThinkingItems,
           finalOutput: dedupedFinalOutput || (latestErrorText ? "" : "No assistant response was returned for this run."),
         };
@@ -564,6 +599,7 @@ export function WorkbenchPage() {
     setActiveThreadId(id);
     setAgentTitle(`Chat ${nextIndex}`);
     setPrompt("");
+    setImageAttachments([]);
     setShowHistory(false);
     setShowActions(false);
   }
@@ -573,6 +609,87 @@ export function WorkbenchPage() {
     setStreamingAssistantText("");
     setThinkingItems([]);
     setShowActions(false);
+  }
+
+  async function handleImageSelection(event: ChangeEvent<HTMLInputElement>) {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    await ingestImageFiles(Array.from(files));
+    event.target.value = "";
+  }
+
+  async function ingestImageFiles(files: File[]) {
+    const supportedExtensions = new Set(["png", "jpg", "jpeg", "heic", "heif", "webp", "gif"]);
+    const next: ImageAttachment[] = [];
+    for (const file of files) {
+      const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+      const isImageMime = file.type.toLowerCase().startsWith("image/");
+      const isSupportedExtension = supportedExtensions.has(extension);
+      if (!isImageMime && !isSupportedExtension) continue;
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error(`Unable to read image: ${file.name}`));
+        reader.readAsDataURL(file);
+      });
+      if (dataUrl) {
+        next.push({ id: crypto.randomUUID(), name: file.name, dataUrl });
+      }
+    }
+    if (next.length === 0) {
+      setError("No supported images found. Use PNG, JPG, JPEG, HEIC, HEIF, WEBP, or GIF.");
+      return;
+    }
+    setImageAttachments((current) => [...current, ...next].slice(0, 6));
+  }
+
+  function removeAttachment(id: string) {
+    setImageAttachments((current) => current.filter((item) => item.id !== id));
+  }
+
+  async function toggleVoiceInput() {
+    if (isTranscribingAudio) return;
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      return;
+    }
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setError("Microphone is not available in this browser.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaChunksRef.current = [];
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) mediaChunksRef.current.push(event.data);
+      };
+      recorder.onstop = async () => {
+        setIsRecording(false);
+        stream.getTracks().forEach((track) => track.stop());
+        const audioBlob = new Blob(mediaChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        mediaChunksRef.current = [];
+        if (!audioBlob.size) return;
+        setIsTranscribingAudio(true);
+        try {
+          const result = await transcribeAudio(audioBlob);
+          const text = result.text.trim();
+          if (text) {
+            setPrompt((current) => (current.trim() ? `${current.trim()} ${text}` : text));
+          }
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Audio transcription failed.");
+        } finally {
+          setIsTranscribingAudio(false);
+        }
+      };
+      recorder.start();
+      setIsRecording(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to access microphone.");
+      setIsRecording(false);
+    }
   }
 
   function resetAgentTitle() {
@@ -980,7 +1097,16 @@ export function WorkbenchPage() {
                 <>
                   {(activeThread?.runs ?? []).map((run) => (
                     <div key={run.id} className="timeline-run-group">
-                      <article className="timeline-card user">{renderTextWithCodeFences(run.prompt)}</article>
+                      <article className="timeline-card user">
+                        {renderTextWithCodeFences(run.prompt)}
+                        {run.promptImages.length > 0 && (
+                          <div className="timeline-inline-images">
+                            {run.promptImages.map((url) => (
+                              <img key={url} src={url} alt="User upload" className="timeline-inline-image" />
+                            ))}
+                          </div>
+                        )}
+                      </article>
                       {run.thinkingItems.map((entry) => (
                         <article className={`timeline-card ${entry.kind}`} key={entry.id}>
                           {entry.kind === "thinking" ? (
@@ -1029,6 +1155,26 @@ export function WorkbenchPage() {
             </div>
 
             <section className={cn("agent-composer", workspaceMissing && "agent-composer-idle")}>
+              <input
+                ref={imageInputRef}
+                type="file"
+                accept=".png,.jpg,.jpeg,.heic,.heif,.webp,.gif,image/png,image/jpeg,image/heic,image/heif,image/webp,image/gif"
+                multiple
+                className="hidden"
+                onChange={(event) => void handleImageSelection(event)}
+              />
+              {imageAttachments.length > 0 && (
+                <div className="composer-attachments" aria-label="Selected images">
+                  {imageAttachments.map((attachment) => (
+                    <div key={attachment.id} className="composer-attachment-chip">
+                      <img src={attachment.dataUrl} alt={attachment.name} />
+                      <button type="button" onClick={() => removeAttachment(attachment.id)} aria-label={`Remove ${attachment.name}`}>
+                        <X />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
               <Textarea
                 ref={composerTextareaRef}
                 className="agent-textarea !min-h-[52px] border-0 bg-transparent px-0 py-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
@@ -1044,10 +1190,29 @@ export function WorkbenchPage() {
                 }
                 readOnly={workspaceMissing}
                 rows={1}
+                onPaste={(event) => {
+                  const clipboardFiles = Array.from(event.clipboardData?.files ?? []);
+                  if (!clipboardFiles.length) return;
+                  const hasImage = clipboardFiles.some(
+                    (file) =>
+                      file.type.toLowerCase().startsWith("image/") ||
+                      ["png", "jpg", "jpeg", "heic", "heif", "webp", "gif"].includes(
+                        file.name.split(".").pop()?.toLowerCase() ?? "",
+                      ),
+                  );
+                  if (!hasImage) return;
+                  event.preventDefault();
+                  void ingestImageFiles(clipboardFiles);
+                }}
               />
               <div className="agent-composer-footer">
                 <div className="agent-composer-tools">
-                  <button className="composer-icon-button" type="button" title="Add context">
+                  <button
+                    className="composer-icon-button"
+                    type="button"
+                    title="Add images"
+                    onClick={() => imageInputRef.current?.click()}
+                  >
                     <Plus />
                   </button>
                   <div className="model-picker">
@@ -1082,11 +1247,27 @@ export function WorkbenchPage() {
                 <button
                   className="composer-primary-button"
                   type="button"
-                  disabled={isRunning || workspaceMissing}
-                  onClick={() => void runAgent()}
-                  title={isRunning ? "Running..." : hasPromptText ? "Send" : "Voice"}
+                  disabled={isRunning || workspaceMissing || isTranscribingAudio}
+                  onClick={() => {
+                    if (hasPromptText || imageAttachments.length > 0) {
+                      void runAgent();
+                      return;
+                    }
+                    void toggleVoiceInput();
+                  }}
+                  title={
+                    isRunning
+                      ? "Running..."
+                      : isTranscribingAudio
+                        ? "Transcribing..."
+                        : hasPromptText || imageAttachments.length > 0
+                          ? "Send"
+                          : isRecording
+                            ? "Stop recording"
+                            : "Voice"
+                  }
                 >
-                  {hasPromptText ? <ArrowUp /> : <Mic />}
+                  {hasPromptText || imageAttachments.length > 0 ? <ArrowUp /> : isRecording ? <Square /> : <Mic />}
                 </button>
               </div>
             </section>
@@ -1228,12 +1409,15 @@ function renderTextWithCodeFences(text: string, mode: RichTextMode = "reflow") {
         components={{
           p: ({ children }) => <p>{children}</p>,
           pre: ({ children }) => <pre>{children}</pre>,
-          code: ({ inline, children, className }) =>
-            inline ? (
+          code: (props) => {
+            const { children, className } = props;
+            const inline = Boolean((props as { inline?: boolean }).inline);
+            return inline ? (
               <code className={`inline-code ${className ?? ""}`.trim()}>{children}</code>
             ) : (
               <code className={className}>{children}</code>
-            ),
+            );
+          },
           table: ({ children }) => <table>{children}</table>,
           thead: ({ children }) => <thead>{children}</thead>,
           tbody: ({ children }) => <tbody>{children}</tbody>,
