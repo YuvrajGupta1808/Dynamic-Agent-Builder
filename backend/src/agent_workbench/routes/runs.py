@@ -30,7 +30,15 @@ def run_stream(
         store=store,
         command_timeout_seconds=settings.command_timeout_seconds,
     )
-    return StreamingResponse(generator, media_type="text/event-stream")
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/runs/{run_id}/interrupts/{interrupt_id}")
