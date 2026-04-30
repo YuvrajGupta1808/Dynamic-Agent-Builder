@@ -31,11 +31,30 @@ export function EventTimeline({ events }: { events: StreamEvent[] }) {
                 <span>{event.message || event.type}</span>
                 <Badge>{event.source}</Badge>
               </div>
-              {event.type !== "token" && <pre>{JSON.stringify(event.data, null, 2)}</pre>}
+              {event.type !== "token" && event.type !== "approval_required" && <pre>{JSON.stringify(event.data, null, 2)}</pre>}
+              {event.type === "approval_required" && <p>{compactApprovalSummary(event)}</p>}
             </div>
           </div>
         );
       })}
     </div>
   );
+}
+
+function compactApprovalSummary(event: StreamEvent): string {
+  const payload = event.data.payload;
+  const tool = typeof event.data.tool === "string" ? event.data.tool : "tool";
+  if (payload && typeof payload === "object") {
+    const command =
+      "command" in payload
+        ? String((payload as { command?: unknown }).command ?? "")
+        : "cmd" in payload
+          ? String((payload as { cmd?: unknown }).cmd ?? "")
+          : "";
+    if (command.trim()) {
+      const compact = command.replace(/\s+/g, " ").trim();
+      return compact.length > 100 ? `${tool}: ${compact.slice(0, 97)}...` : `${tool}: ${compact}`;
+    }
+  }
+  return `Approval required for ${tool}`;
 }

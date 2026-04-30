@@ -49,6 +49,7 @@ import type {
   ApprovalData,
   ChatContentPart,
   FileTreeNode,
+  SessionMode,
   SessionRecord,
   StreamEvent,
   WorkspaceSummary,
@@ -103,13 +104,16 @@ export function WorkbenchPage() {
   const [streamingAssistantText, setStreamingAssistantText] = useState("");
   const [agentTitle, setAgentTitle] = useState("Agents");
   const [selectedModel, setSelectedModel] = useState<string>("openai:accounts/fireworks/models/qwen3p6-plus");
+  const [selectedMode, setSelectedMode] = useState<SessionMode>("accept_edits");
   const [showModelMenu, setShowModelMenu] = useState(false);
+  const [showModeMenu, setShowModeMenu] = useState(false);
   const [recentPrompts, setRecentPrompts] = useState<string[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [showActions, setShowActions] = useState(false);
   const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
+  const [isDecidingApproval, setIsDecidingApproval] = useState(false);
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([{ id: crypto.randomUUID(), title: "Agents", runs: [] }]);
   const [activeThreadId, setActiveThreadId] = useState<string>("");
   const activeThread = chatThreads.find((thread) => thread.id === activeThreadId) ?? chatThreads[0];
@@ -203,6 +207,7 @@ export function WorkbenchPage() {
       setRequireClerkJwt(Boolean(nextConfig.clerkAuthEnabled));
       setConfig(nextConfig);
       setSelectedModel("openai:accounts/fireworks/models/qwen3p6-plus");
+      setSelectedMode("accept_edits");
       const workspaceResponse = await getWorkspaces();
       const nextWorkspaces = workspaceResponse.workspaces;
       setWorkspaces(nextWorkspaces);
@@ -254,7 +259,7 @@ export function WorkbenchPage() {
     const created = await createSession({
       workspace: name,
       workspaceMode: "local",
-      mode: "accept_edits",
+      mode: selectedMode,
       model: modelForSession,
     });
     setChatThreads([{ id: firstThreadId, title: "Agents", runs: [], backendSession: created }]);
@@ -418,7 +423,7 @@ export function WorkbenchPage() {
           message: userPrompt,
           messages: [...transcriptMessages, { role: "user", content: currentUserContent }],
           model: activeModel,
-          mode: "accept_edits",
+          mode: selectedMode,
         },
         (event) => {
         sawAnyEvent = true;
@@ -494,7 +499,7 @@ export function WorkbenchPage() {
         sessionForRun = await createSession({
           workspace: activeWorkspace,
           workspaceMode: "local",
-          mode: "accept_edits",
+          mode: selectedMode,
           model: activeModel,
         });
         setChatThreads((prev) =>
@@ -583,9 +588,16 @@ export function WorkbenchPage() {
 
   async function handleApproval(decision: "approve" | "reject") {
     if (!approval) return;
-    await decideInterrupt(approval.runId, approval.interruptId, decision);
-    setTerminalLines((current) => [...current, `[${decision}] ${approval.tool}`]);
-    setApproval(null);
+    setIsDecidingApproval(true);
+    try {
+      await decideInterrupt(approval.runId, approval.interruptId, decision);
+      setTerminalLines((current) => [...current, `[${decision}] ${approval.tool}`]);
+      setApproval(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to submit approval decision.");
+    } finally {
+      setIsDecidingApproval(false);
+    }
   }
 
   const hasUnsavedChanges = !!selectedPath && fileContent !== savedContent;
@@ -1143,6 +1155,27 @@ export function WorkbenchPage() {
                           <p>Thinking...</p>
                         </article>
                       )}
+                      {approval && (
+                        <article className="timeline-card system approval-inline-card">
+                          <p className="approval-meta-line">
+                            <span>Tool: <strong>{approval.tool}</strong></span>
+                          </p>
+                          <p className="approval-command-preview">{approvalSummaryForCard(approval)}</p>
+                          <div className="approval-actions">
+                            <Button
+                              variant="outline"
+                              disabled={isDecidingApproval}
+                              onClick={() => void handleApproval("reject")}
+                            >
+                              Reject
+                            </Button>
+                            <Button disabled={isDecidingApproval} onClick={() => void handleApproval("approve")}>
+                              <Check data-icon="inline-start" />
+                              Approve
+                            </Button>
+                          </div>
+                        </article>
+                      )}
                       {streamingAssistantText && (
                         <article className="timeline-card assistant live">
                           {renderTextWithCodeFences(streamingAssistantText)}
@@ -1177,7 +1210,7 @@ export function WorkbenchPage() {
               )}
               <Textarea
                 ref={composerTextareaRef}
-                className="agent-textarea !min-h-[52px] border-0 bg-transparent px-0 py-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
+                className="agent-textarea min-h-[52px]! border-0 bg-transparent px-0 py-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
                 value={prompt}
                 onChange={(event) => {
                   setPrompt(event.target.value);
@@ -1243,6 +1276,38 @@ export function WorkbenchPage() {
                       </div>
                     )}
                   </div>
+                  <div className="model-picker">
+                    <button
+                      className="agent-model-pill"
+                      type="button"
+                      title="Select agent permission mode"
+                      onClick={() => setShowModeMenu((v) => !v)}
+                    >
+                      <span>{formatModeLabel(selectedMode)}</span>
+                      <ChevronDown />
+                    </button>
+                    {showModeMenu && (
+                      <div className="model-menu" role="menu" aria-label="Mode selector">
+                        {(config?.modes ?? [
+                          { id: "ask_before_edits", name: "Ask before edits" },
+                          { id: "accept_edits", name: "Accept edits, ask execute" },
+                          { id: "accept_everything", name: "Accept everything" },
+                        ]).map((mode) => (
+                          <button
+                            key={mode.id}
+                            type="button"
+                            className={mode.id === selectedMode ? "model-menu-item active" : "model-menu-item"}
+                            onClick={() => {
+                              setSelectedMode(mode.id);
+                              setShowModeMenu(false);
+                            }}
+                          >
+                            {mode.name}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <button
                   className="composer-primary-button"
@@ -1286,26 +1351,6 @@ export function WorkbenchPage() {
           </Panel>
         </Group>
 
-      {approval && (
-        <div className="approval-backdrop">
-          <div className="approval-dialog">
-            <div>
-              <h2>Approve terminal command</h2>
-              <p>{approval.tool}</p>
-            </div>
-            <pre>{JSON.stringify(approval.payload, null, 2)}</pre>
-            <div className="approval-actions">
-              <Button variant="outline" onClick={() => void handleApproval("reject")}>
-                Reject
-              </Button>
-              <Button onClick={() => void handleApproval("approve")}>
-                <Check data-icon="inline-start" />
-                Approve
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
     </main>
     </>
   );
@@ -1357,6 +1402,24 @@ function formatData(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+export function readApprovalCommand(approval: ApprovalData | null): string {
+  if (!approval) return "";
+  const payload = approval.payload;
+  if (typeof payload !== "object" || !payload) return "";
+  if ("command" in payload) return String((payload as { command: unknown }).command ?? "");
+  if ("cmd" in payload) return String((payload as { cmd: unknown }).cmd ?? "");
+  return "";
+}
+
+function approvalSummaryForCard(approval: ApprovalData | null): string {
+  if (!approval) return "Review and approve to continue.";
+  const command = readApprovalCommand(approval).replace(/\s+/g, " ").trim();
+  if (command) {
+    return command.length > 120 ? `${command.slice(0, 117)}...` : command;
+  }
+  return "This action needs approval before the run can continue.";
 }
 
 function thinkingKindForEvent(event: StreamEvent): "tool" | "thinking" | "error" {
@@ -1491,12 +1554,19 @@ function extractThinkingAndToolsFromAssistantText(text: string): Array<{ id: str
 function formatModelLabel(model: string | undefined): string {
   if (!model) return "Loading model";
   const normalized = model.toLowerCase();
-  if (normalized.includes("minimax-m2")) return "model minimax m2";
-  if (normalized.includes("qwen3p6-plus")) return "model qwen3.6 plus";
-  if (normalized.includes("kimi-k2-thinking")) return "model kimi k2 thinking";
-  if (normalized.includes("glm-4p7")) return "model glm 4.7";
+  if (normalized.includes("minimax-m2")) return "Minimax m2";
+  if (normalized.includes("qwen3p6-plus")) return "Qwen3.6 plus";
+  if (normalized.includes("kimi-k2-thinking")) return "Kimi k2 thinking";
+  if (normalized.includes("glm-4p7")) return "Glm 4.7";
   const slashPart = model.split("/").pop() || model;
-  return `model ${slashPart.replace(/^models[:/-]?/i, "")}`;
+  const cleaned = slashPart.replace(/^models[:/-]?/i, "").trim();
+  return cleaned ? `${cleaned.charAt(0).toUpperCase()}${cleaned.slice(1)}` : "Model";
+}
+
+export function formatModeLabel(mode: SessionMode): string {
+  if (mode === "ask_before_edits") return "Ask before edits";
+  if (mode === "accept_everything") return "Accept everything";
+  return "Accept edits";
 }
 
 function deriveAgentTitle(prompt: string): string {
