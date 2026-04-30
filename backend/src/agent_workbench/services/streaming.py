@@ -13,7 +13,22 @@ from uuid import uuid4
 
 from ..domain.agents import AgentSessionContext, build_agent
 from ..domain.models import ApprovalRecord, RunStreamRequest, SessionRecord, StreamEvent
+from ..infra.deep_agent_resources import ensure_session_store_seeded, get_langgraph_store
 from ..infra.session_store import SessionStore
+
+MAX_RUN_MESSAGES = 64
+MAX_MESSAGE_CHARS = 120_000
+
+
+def messages_for_agent_run(request: RunStreamRequest) -> list[dict[str, str]]:
+    """LangChain-compatible chat turns for the Deep Agent graph (multi-turn)."""
+    if request.messages is not None and len(request.messages) > 0:
+        trimmed = request.messages[-MAX_RUN_MESSAGES:]
+        return [
+            {"role": m.role, "content": (m.content or "")[:MAX_MESSAGE_CHARS]}
+            for m in trimmed
+        ]
+    return [{"role": "user", "content": (request.message or "")[:MAX_MESSAGE_CHARS]}]
 
 
 class EventSequencer:
@@ -199,7 +214,13 @@ def normalize_chunk(
                 )
         thinking = _message_thinking(token)
         if thinking:
-            events.append(sequencer.event("thinking", source=source, message=thinking, data={"metadata": data[1] if len(data) > 1 else {}}))
+            # LangGraph `stream_mode=["updates","messages",...]` delivers the same reasoning
+            # twice: incremental AIMessageChunks on `messages`, then consolidated state on
+            # `updates`. The UI showed both (spaced fragments + clean duplicate). When
+            # `emit_update_tokens` is False we are in that dual-stream layout—emit thinking
+            # only from the `updates` branch below.
+            if emit_update_tokens:
+                events.append(sequencer.event("thinking", source=source, message=thinking, data={"metadata": data[1] if len(data) > 1 else {}}))
         content = _message_content(token)
         if content and _token_type(token) != "tool":
             events.append(sequencer.event("token", source=source, message=content, data={"metadata": data[1] if len(data) > 1 else {}}))
@@ -318,7 +339,9 @@ def stream_run(
         return
 
     try:
+        ensure_session_store_seeded(get_langgraph_store(), session.id)
         agent = build_agent(context)
+        stream_messages = messages_for_agent_run(request)
         saw_assistant_token = False
         last_reasoning_message = ""
         chunk_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -336,7 +359,7 @@ def stream_run(
                 chunks: Iterable[Any]
                 try:
                     chunks = agent.stream(
-                        {"messages": [{"role": "user", "content": request.message}]},
+                        {"messages": stream_messages},
                         stream_mode=["updates", "messages", "custom"],
                         subgraphs=True,
                         version="v2",
@@ -345,7 +368,7 @@ def stream_run(
                 except TypeError:
                     updates_only_stream_mode = True
                     chunks = agent.stream(
-                        {"messages": [{"role": "user", "content": request.message}]},
+                        {"messages": stream_messages},
                         stream_mode="updates",
                         subgraphs=True,
                         version="v2",
