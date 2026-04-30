@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 WorkspaceMode = Literal["local", "uploaded", "remote_sandbox"]
 SessionMode = Literal["ask_before_edits", "accept_edits", "accept_everything"]
@@ -41,10 +41,26 @@ class SessionRecord(StrictModel):
     created_at: str = Field(alias="createdAt")
 
 
+class ChatMessage(StrictModel):
+    role: Literal["user", "assistant", "system"]
+    content: str = Field(default="", max_length=200_000)
+
+
 class RunStreamRequest(StrictModel):
-    message: str
+    """Either send `message` (single user turn) or `messages` (full transcript for multi-turn)."""
+
+    message: str = ""
     model: str | None = None
     mode: SessionMode | None = None
+    messages: list[ChatMessage] | None = None
+
+    @model_validator(mode="after")
+    def _require_some_input(self) -> RunStreamRequest:
+        if self.messages is not None and len(self.messages) > 0:
+            return self
+        if (self.message or "").strip():
+            return self
+        raise ValueError("Provide non-empty `message` or at least one entry in `messages`")
 
 
 class GenerateTitleRequest(StrictModel):
