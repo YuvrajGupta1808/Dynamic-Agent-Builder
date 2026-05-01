@@ -1,62 +1,67 @@
 import Editor from "@monaco-editor/react";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
-  ArrowUp,
-  Check,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  Code2,
-  FilePlus2,
-  FolderGit2,
-  History,
-  Mic,
-  MoreHorizontal,
-  PanelLeftClose,
-  Plus,
-  RefreshCw,
-  Save,
-  Square,
-  SquareTerminal,
-  X,
+    ArrowUp,
+    Check,
+    ChevronDown,
+    ChevronLeft,
+    ChevronRight,
+    Code2,
+    FilePlus2,
+    FolderGit2,
+    History,
+    Mic,
+    MoreHorizontal,
+    PanelLeftClose,
+    Plus,
+    RefreshCw,
+    Save,
+    Square,
+    SquareTerminal,
+    X,
 } from "lucide-react";
-import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
-import { Link } from "react-router-dom";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
+import { Link } from "react-router-dom";
 import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
 
+import { EventTimeline } from "../components/EventTimeline";
 import { FileTree } from "../components/FileTree";
-import { cn } from "../lib/utils";
 import { Button } from "../components/ui/button";
 import { Textarea } from "../components/ui/textarea";
 import {
-  applyFile,
-  createSession,
-  createWorkspace,
-  decideInterrupt,
-  getConfig,
-  getFileContent,
-  getFileTree,
-  getWorkspaces,
-  streamRun,
-  transcribeAudio,
+    applyFile,
+    createSession,
+    createWorkspace,
+    decideInterrupt,
+    getConfig,
+    getFileContent,
+    getFileTree,
+    getWorkspaces,
+    streamRun,
+    transcribeAudio,
 } from "../lib/api";
 import { setRequireClerkJwt } from "../lib/auth-token";
+import { cn } from "../lib/utils";
 import type {
-  AppConfig,
-  ApprovalData,
-  ChatContentPart,
-  FileTreeNode,
-  SessionMode,
-  SessionRecord,
-  StreamEvent,
-  WorkspaceSummary,
+    AppConfig,
+    ApprovalData,
+    ChatContentPart,
+    FileTreeNode,
+    SessionMode,
+    SessionRecord,
+    StreamEvent,
+    TodoItem,
+    WorkspaceSummary,
 } from "../types/api";
 
 export function WorkbenchPage() {
-  const FIREWORKS_MODEL_OPTIONS = ["openai:accounts/fireworks/models/qwen3p6-plus"] as const;
+  const FIREWORKS_MODEL_OPTIONS = [
+    "openai:accounts/fireworks/models/glm-4p7",
+    "openai:accounts/fireworks/models/qwen3p6-plus",
+  ] as const;
   type ThinkingItem = {
     id: string;
     kind: "tool" | "thinking" | "error";
@@ -67,6 +72,7 @@ export function WorkbenchPage() {
     prompt: string;
     promptImages: string[];
     thinkingItems: ThinkingItem[];
+    events: StreamEvent[];
     finalOutput: string;
   };
   type ImageAttachment = {
@@ -96,14 +102,18 @@ export function WorkbenchPage() {
   const [prompt, setPrompt] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [approval, setApproval] = useState<ApprovalData | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<ApprovalData[]>([]);
+  const [approvalFeedback, setApprovalFeedback] = useState("");
+  const [approvalEditDraft, setApprovalEditDraft] = useState("");
+  const [approvalEditMode, setApprovalEditMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [thinkingItems, setThinkingItems] = useState<ThinkingItem[]>([]);
   const [lastSubmittedPrompt, setLastSubmittedPrompt] = useState("");
   const [finalOutput, setFinalOutput] = useState("");
   const [streamingAssistantText, setStreamingAssistantText] = useState("");
+  const [liveRunEvents, setLiveRunEvents] = useState<StreamEvent[]>([]);
   const [agentTitle, setAgentTitle] = useState("Agents");
-  const [selectedModel, setSelectedModel] = useState<string>("openai:accounts/fireworks/models/qwen3p6-plus");
+  const [selectedModel, setSelectedModel] = useState<string>("");
   const [selectedMode, setSelectedMode] = useState<SessionMode>("accept_edits");
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showModeMenu, setShowModeMenu] = useState(false);
@@ -117,6 +127,7 @@ export function WorkbenchPage() {
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([{ id: crypto.randomUUID(), title: "Agents", runs: [] }]);
   const [activeThreadId, setActiveThreadId] = useState<string>("");
   const activeThread = chatThreads.find((thread) => thread.id === activeThreadId) ?? chatThreads[0];
+  const approval = pendingApprovals[0] ?? null;
   const streamBufferRef = useRef("");
   const structuredEventsSeenRef = useRef(false);
   const backendFailureRef = useRef(false);
@@ -170,6 +181,18 @@ export function WorkbenchPage() {
     }
   }, [activeThreadId, chatThreads]);
 
+  useEffect(() => {
+    if (!approval) {
+      setApprovalFeedback("");
+      setApprovalEditDraft("");
+      setApprovalEditMode(false);
+      return;
+    }
+    setApprovalFeedback("");
+    setApprovalEditDraft(defaultEditedActionDraft(approval));
+    setApprovalEditMode(false);
+  }, [approval?.interruptId]);
+
   useLayoutEffect(() => {
     resizeComposerTextarea();
   }, [prompt, resizeComposerTextarea]);
@@ -206,7 +229,7 @@ export function WorkbenchPage() {
       // Match frontend bearer strategy with backend capability.
       setRequireClerkJwt(Boolean(nextConfig.clerkAuthEnabled));
       setConfig(nextConfig);
-      setSelectedModel("openai:accounts/fireworks/models/qwen3p6-plus");
+      setSelectedModel(nextConfig.defaultModel);
       setSelectedMode("accept_edits");
       const workspaceResponse = await getWorkspaces();
       const nextWorkspaces = workspaceResponse.workspaces;
@@ -249,6 +272,8 @@ export function WorkbenchPage() {
     setLastSubmittedPrompt("");
     setFinalOutput("");
     setStreamingAssistantText("");
+    setLiveRunEvents([]);
+    setPendingApprovals([]);
     streamBufferRef.current = "";
     structuredEventsSeenRef.current = false;
     backendFailureRef.current = false;
@@ -378,6 +403,8 @@ export function WorkbenchPage() {
     setFinalOutput("");
     setThinkingItems([]);
     setStreamingAssistantText("");
+    setLiveRunEvents([]);
+    setPendingApprovals([]);
     streamBufferRef.current = "";
     structuredEventsSeenRef.current = false;
     backendFailureRef.current = false;
@@ -389,6 +416,8 @@ export function WorkbenchPage() {
     let runFinalOutput = "";
     let latestErrorText = "";
     let liveThinkingItems: ThinkingItem[] = [];
+    let liveEvents: StreamEvent[] = [];
+    const seenThinkingTexts = new Set<string>();
     const activeModel = selectedModel || config.defaultModel;
     const executeRun = async (sessionId: string, priorRuns: CompletedRun[]) => {
       setChatThreads((current) =>
@@ -426,6 +455,8 @@ export function WorkbenchPage() {
           mode: selectedMode,
         },
         (event) => {
+        liveEvents = [...liveEvents, event];
+        setLiveRunEvents(liveEvents);
         sawAnyEvent = true;
         const terminalLine = terminalLineForEvent(event);
         if (terminalLine) {
@@ -434,7 +465,14 @@ export function WorkbenchPage() {
         const thinkingText = thinkingLineForEvent(event);
         if (thinkingText) {
           const kind = thinkingKindForEvent(event);
-          if (kind === "thinking") latestReasoningText = thinkingText;
+          if (kind === "thinking") {
+            const normalizedThinking = thinkingText.trim();
+            if (seenThinkingTexts.has(normalizedThinking)) {
+              return;
+            }
+            seenThinkingTexts.add(normalizedThinking);
+            latestReasoningText = normalizedThinking;
+          }
           const last = liveThinkingItems[liveThinkingItems.length - 1];
           if (kind === "thinking" && last && last.kind === "thinking") {
             const joiner = last.text.endsWith(" ") || thinkingText.startsWith(" ") ? "" : " ";
@@ -471,7 +509,13 @@ export function WorkbenchPage() {
           setStreamingAssistantText(streamBufferRef.current);
         }
         if (event.type === "approval_required") {
-          setApproval(event.data as unknown as ApprovalData);
+          const nextApproval = event.data as unknown as ApprovalData;
+          setPendingApprovals((current) => {
+            if (current.some((item) => item.interruptId === nextApproval.interruptId)) {
+              return current;
+            }
+            return [...current, nextApproval];
+          });
         }
         if (event.type === "done") {
           if (streamBufferRef.current.trim()) {
@@ -550,6 +594,7 @@ export function WorkbenchPage() {
           prompt: userPrompt,
           promptImages: activeImageAttachments.map((item) => item.dataUrl),
           thinkingItems: liveThinkingItems,
+          events: liveEvents,
           finalOutput: dedupedFinalOutput || (latestErrorText ? "" : "No assistant response was returned for this run."),
         };
         setChatThreads((current) => {
@@ -567,6 +612,7 @@ export function WorkbenchPage() {
       setThinkingItems([]);
       setFinalOutput("");
       setStreamingAssistantText("");
+      setLiveRunEvents([]);
       setIsRunning(false);
     }
   }
@@ -586,13 +632,21 @@ export function WorkbenchPage() {
     setThinkingItems(derived);
   }, [streamingAssistantText, finalOutput]);
 
-  async function handleApproval(decision: "approve" | "reject") {
+  async function handleApproval(
+    decision: "approve" | "reject" | "edit",
+    options: { reason?: string; editedAction?: Record<string, unknown> } = {},
+  ) {
     if (!approval) return;
     setIsDecidingApproval(true);
     try {
-      await decideInterrupt(approval.runId, approval.interruptId, decision);
-      setTerminalLines((current) => [...current, `[${decision}] ${approval.tool}`]);
-      setApproval(null);
+      await decideInterrupt(approval.runId, approval.interruptId, {
+        decision,
+        reason: options.reason,
+        editedAction: options.editedAction,
+      });
+      const approvalLabel = approvalCheckpointLabel(approval);
+      setTerminalLines((current) => [...current, `[${decision}] ${approval.tool}${approvalLabel ? ` (${approvalLabel})` : ""}`]);
+      setPendingApprovals((current) => current.filter((item) => item.interruptId !== approval.interruptId));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to submit approval decision.");
     } finally {
@@ -600,9 +654,35 @@ export function WorkbenchPage() {
     }
   }
 
+  async function approveCurrentApproval() {
+    await handleApproval("approve");
+  }
+
+  async function rejectCurrentApproval() {
+    const reason = approvalFeedback.trim() || defaultRejectReason(approval);
+    await handleApproval("reject", { reason });
+  }
+
+  async function submitEditedApproval() {
+    if (!approval) return;
+    try {
+      const editedAction = parseEditedActionDraft(approvalEditDraft, approval);
+      await handleApproval("edit", {
+        reason: approvalFeedback.trim() || undefined,
+        editedAction,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Invalid edited approval payload.");
+    }
+  }
+
   const hasUnsavedChanges = !!selectedPath && fileContent !== savedContent;
   const saveLabel = !selectedPath ? "Open a file to save" : isSaving ? "Saving..." : hasUnsavedChanges ? "Save" : "Saved";
   const hasPromptText = prompt.trim().length > 0;
+  const modelOptions = useMemo(() => {
+    const configured = (config?.models ?? []).map((model) => model.value);
+    return configured.length > 0 ? configured : [...FIREWORKS_MODEL_OPTIONS];
+  }, [config]);
 
   function newTask() {
     const nextIndex = chatThreads.length + 1;
@@ -1130,6 +1210,7 @@ export function WorkbenchPage() {
                           )}
                         </article>
                       ))}
+                      <RunOrchestrationTrace events={run.events} />
                       {run.finalOutput && <article className="timeline-card assistant">{renderTextWithCodeFences(run.finalOutput)}</article>}
                     </div>
                   ))}
@@ -1150,31 +1231,27 @@ export function WorkbenchPage() {
                           )}
                         </article>
                       ))}
+                      <RunOrchestrationTrace events={liveRunEvents} live={isRunning} />
                       {isRunning && thinkingItems.length === 0 && !streamingAssistantText && !finalOutput && (
                         <article className="timeline-card thinking">
                           <p>Thinking...</p>
                         </article>
                       )}
                       {approval && (
-                        <article className="timeline-card system approval-inline-card">
-                          <p className="approval-meta-line">
-                            <span>Tool: <strong>{approval.tool}</strong></span>
-                          </p>
-                          <p className="approval-command-preview">{approvalSummaryForCard(approval)}</p>
-                          <div className="approval-actions">
-                            <Button
-                              variant="outline"
-                              disabled={isDecidingApproval}
-                              onClick={() => void handleApproval("reject")}
-                            >
-                              Reject
-                            </Button>
-                            <Button disabled={isDecidingApproval} onClick={() => void handleApproval("approve")}>
-                              <Check data-icon="inline-start" />
-                              Approve
-                            </Button>
-                          </div>
-                        </article>
+                        <ApprovalReviewCard
+                          approval={approval}
+                          pendingCount={pendingApprovals.length}
+                          feedback={approvalFeedback}
+                          editDraft={approvalEditDraft}
+                          editMode={approvalEditMode}
+                          busy={isDecidingApproval}
+                          onFeedbackChange={setApprovalFeedback}
+                          onEditDraftChange={setApprovalEditDraft}
+                          onToggleEditMode={setApprovalEditMode}
+                          onReject={() => void rejectCurrentApproval()}
+                          onApprove={() => void approveCurrentApproval()}
+                          onSubmitEdit={() => void submitEditedApproval()}
+                        />
                       )}
                       {streamingAssistantText && (
                         <article className="timeline-card assistant live">
@@ -1260,7 +1337,7 @@ export function WorkbenchPage() {
                     </button>
                     {showModelMenu && (
                       <div className="model-menu" role="menu" aria-label="Model selector">
-                        {FIREWORKS_MODEL_OPTIONS.map((model) => (
+                        {modelOptions.map((model) => (
                           <button
                             key={model}
                             type="button"
@@ -1356,8 +1433,109 @@ export function WorkbenchPage() {
   );
 }
 
+type CheckpointPhase = "architecture_review" | "pre_publish_review" | "post_publish_review";
+
+type CheckpointReviewData = {
+  phase: CheckpointPhase;
+  summary: string;
+  findings: string[];
+  nextSteps: string[];
+  commands: string[];
+  files: string[];
+  questionsForHuman: string[];
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => (typeof item === "string" && item.trim() ? [item.trim()] : []));
+}
+
+function isCheckpointApproval(approval: ApprovalData | null): approval is ApprovalData {
+  return Boolean(approval && approval.tool === "request_checkpoint_review");
+}
+
+function readCheckpointReviewData(approval: ApprovalData | null): CheckpointReviewData | null {
+  if (!isCheckpointApproval(approval)) return null;
+  const payload = isRecord(approval.payload) ? approval.payload : {};
+  const phase = readString(payload.phase);
+  if (phase !== "architecture_review" && phase !== "pre_publish_review" && phase !== "post_publish_review") {
+    return null;
+  }
+  return {
+    phase,
+    summary: readString(payload.summary),
+    findings: readStringArray(payload.findings),
+    nextSteps: readStringArray(payload.next_steps),
+    commands: readStringArray(payload.commands),
+    files: readStringArray(payload.files),
+    questionsForHuman: readStringArray(payload.questions_for_human),
+  };
+}
+
+function approvalCheckpointLabel(approval: ApprovalData | null): string {
+  return readCheckpointReviewData(approval)?.phase ?? "";
+}
+
+function formatCheckpointPhase(phase: string): string {
+  return phase
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function defaultEditedActionDraft(approval: ApprovalData | null): string {
+  if (!approval) return "";
+  return JSON.stringify({ name: approval.tool, args: approval.payload }, null, 2);
+}
+
+function defaultRejectReason(approval: ApprovalData | null): string {
+  const checkpoint = readCheckpointReviewData(approval);
+  if (checkpoint) {
+    return `Please revise the ${formatCheckpointPhase(checkpoint.phase)} checkpoint and wait for another review.`;
+  }
+  return approval ? `User rejected ${approval.tool}.` : "User rejected this action.";
+}
+
+function parseEditedActionDraft(text: string, approval: ApprovalData): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Edited approval payload must be valid JSON.");
+  }
+  if (!isRecord(parsed)) {
+    throw new Error("Edited approval payload must be a JSON object.");
+  }
+  const maybeName = readString(parsed.name);
+  const maybeArgs = parsed.args;
+  if (maybeName) {
+    if (!isRecord(maybeArgs)) {
+      throw new Error("Edited approval payload must include an object `args` field.");
+    }
+    return { name: maybeName, args: maybeArgs };
+  }
+  return { name: approval.tool, args: parsed };
+}
+
 function terminalLineForEvent(event: StreamEvent): string | null {
   if (event.type === "custom" || event.type === "update") return null;
+  if (event.type === "todo") {
+    const items = readTodoItems(event.data.items);
+    if (!items.length) return "[todo] updated";
+    return `[todo] ${items.map((item) => `${item.status}: ${item.text}`).join(" | ")}`;
+  }
+  if (event.type === "subagent") {
+    const name = readString(event.data.name) || prettifySpecialistLabel(event.source);
+    const status = readString(event.data.status);
+    const summary = event.message || readString(event.data.summary);
+    const suffix = [status, summary].filter(Boolean).join(" · ");
+    return suffix ? `[subagent] ${name}: ${suffix}` : `[subagent] ${name}`;
+  }
   if (event.type === "thinking") {
     return `[thinking] ${event.message || ""}`;
   }
@@ -1373,10 +1551,7 @@ function terminalLineForEvent(event: StreamEvent): string | null {
   }
   if (event.type === "approval_required") {
     const tool = readString(event.data.tool) || "tool";
-    const payload = event.data.payload;
-    const command =
-      typeof payload === "object" && payload && "command" in payload ? String((payload as { command: unknown }).command) : formatData(payload);
-    return `[approval required] ${tool}: ${command}`;
+    return `[approval required] ${approvalSummaryFromData(tool, event.data.payload)}`;
   }
   if (event.type === "file_change") {
     return `[file] ${event.message || formatData(event.data)}`;
@@ -1415,6 +1590,11 @@ export function readApprovalCommand(approval: ApprovalData | null): string {
 
 function approvalSummaryForCard(approval: ApprovalData | null): string {
   if (!approval) return "Review and approve to continue.";
+  const checkpoint = readCheckpointReviewData(approval);
+  if (checkpoint) {
+    if (checkpoint.summary) return checkpoint.summary;
+    return `Review ${formatCheckpointPhase(checkpoint.phase)} before continuing.`;
+  }
   const command = readApprovalCommand(approval).replace(/\s+/g, " ").trim();
   if (command) {
     return command.length > 120 ? `${command.slice(0, 117)}...` : command;
@@ -1430,6 +1610,18 @@ function thinkingKindForEvent(event: StreamEvent): "tool" | "thinking" | "error"
 
 function thinkingLineForEvent(event: StreamEvent): string | null {
   if (event.type === "custom" || event.type === "update") return null;
+  if (event.type === "todo") {
+    const items = readTodoItems(event.data.items);
+    if (!items.length) return "Todo list updated";
+    const active = items.find((item) => item.status === "active");
+    return active ? `Working: ${active.text}` : `Todo: ${items.map((item) => item.text).join(", ")}`;
+  }
+  if (event.type === "subagent") {
+    const name = readString(event.data.name) || prettifySpecialistLabel(event.source);
+    const status = readString(event.data.status);
+    const summary = event.message || readString(event.data.summary);
+    return [name, status, summary].filter(Boolean).join(" · ");
+  }
   if (event.type === "thinking") {
     const text = (event.message || "").replace(/\s+/g, " ").trim();
     if (!text) return null;
@@ -1449,7 +1641,7 @@ function thinkingLineForEvent(event: StreamEvent): string | null {
   }
   if (event.type === "approval_required") {
     const tool = readString(event.data.tool) || "tool";
-    return `Approval required: ${tool}`;
+    return `Approval required: ${approvalSummaryFromData(tool, event.data.payload)}`;
   }
   if (event.type === "file_change") {
     return event.message || formatData(event.data) || "File changed";
@@ -1499,6 +1691,341 @@ function renderTextWithCodeFences(text: string, mode: RichTextMode = "reflow") {
         {source}
       </ReactMarkdown>
     </div>
+  );
+}
+
+function readTodoItems(value: unknown): TodoItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const maybe = item as Partial<TodoItem>;
+    if (
+      typeof maybe.id !== "string" ||
+      typeof maybe.text !== "string" ||
+      (maybe.status !== "pending" && maybe.status !== "active" && maybe.status !== "completed")
+    ) {
+      return [];
+    }
+    return [{ id: maybe.id, text: maybe.text, status: maybe.status }];
+  });
+}
+
+const SPECIALIST_NAMES = new Set([
+  "decomposer",
+  "template_selector",
+  "agent_initializer",
+  "workspace_initializer",
+  "context_specialist",
+  "cli_specialist",
+  "sdk_specialist",
+  "integration_specialist",
+  "trigger_specialist",
+  "session_specialist",
+  "documentation_specialist",
+  "editor",
+  "tester",
+  "validator",
+  "publisher",
+  "async_tester",
+  "async_publisher",
+  "async_session_specialist",
+]);
+
+function normalizeSpecialistSource(source: string): string | null {
+  const cleaned = source.replace(/^tools:/, "").trim();
+  return SPECIALIST_NAMES.has(cleaned) ? cleaned : null;
+}
+
+function prettifySpecialistLabel(source: string): string {
+  return source
+    .replace(/^tools:/, "")
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function summarizeTraceEvent(event: StreamEvent): string {
+  if (event.type === "subagent") {
+    return [readString(event.data.status), event.message || readString(event.data.summary)].filter(Boolean).join(" · ");
+  }
+  if (event.type === "tool_call") {
+    const command =
+      typeof event.data.args === "object" && event.data.args && "command" in event.data.args
+        ? String((event.data.args as { command: unknown }).command ?? "")
+        : "";
+    const name = readString(event.data.name) || "tool";
+    return command || name;
+  }
+  if (event.type === "file_change") return event.message || "File changed";
+  if (event.type === "approval_required") return approvalSummaryForEvent(event);
+  if (event.type === "todo") {
+    const items = readTodoItems(event.data.items);
+    return items.map((item) => `${item.status}: ${item.text}`).join(" | ");
+  }
+  return event.message || "";
+}
+
+function isVisibleTraceEvent(event: StreamEvent): boolean {
+  return (
+    event.type === "subagent" ||
+    event.type === "tool_call" ||
+    event.type === "file_change" ||
+    event.type === "approval_required" ||
+    event.type === "error"
+  );
+}
+
+function approvalSummaryForEvent(event: StreamEvent): string {
+  const tool = readString(event.data.tool) || "tool";
+  return approvalSummaryFromData(tool, event.data.payload);
+}
+
+function approvalSummaryFromData(tool: string, payload: unknown): string {
+  if (tool === "request_checkpoint_review" && isRecord(payload)) {
+    const phase = readString(payload.phase);
+    const summary = readString(payload.summary);
+    const label = phase ? formatCheckpointPhase(phase) : "Checkpoint review";
+    return summary ? `${label}: ${summary}` : label;
+  }
+  const command =
+    isRecord(payload) && "command" in payload
+      ? String(payload.command ?? "")
+      : isRecord(payload) && "cmd" in payload
+        ? String(payload.cmd ?? "")
+        : "";
+  return command ? `${tool}: ${command}` : tool;
+}
+
+function ApprovalReviewCard({
+  approval,
+  pendingCount,
+  feedback,
+  editDraft,
+  editMode,
+  busy,
+  onFeedbackChange,
+  onEditDraftChange,
+  onToggleEditMode,
+  onReject,
+  onApprove,
+  onSubmitEdit,
+}: {
+  approval: ApprovalData;
+  pendingCount: number;
+  feedback: string;
+  editDraft: string;
+  editMode: boolean;
+  busy: boolean;
+  onFeedbackChange: (value: string) => void;
+  onEditDraftChange: (value: string) => void;
+  onToggleEditMode: (value: boolean) => void;
+  onReject: () => void;
+  onApprove: () => void;
+  onSubmitEdit: () => void;
+}) {
+  const checkpoint = readCheckpointReviewData(approval);
+  const allowedDecisions = approval.allowedDecisions ?? ["approve", "reject"];
+  const editAllowed = allowedDecisions.includes("edit");
+  const queueRemainder = Math.max(0, pendingCount - 1);
+
+  return (
+    <article className="timeline-card system approval-inline-card">
+      <div className="approval-header">
+        <div>
+          <p className="approval-meta-line">
+            <span>
+              Tool: <strong>{approval.tool}</strong>
+            </span>
+            {checkpoint?.phase ? (
+              <span className="approval-phase-chip">{formatCheckpointPhase(checkpoint.phase)}</span>
+            ) : null}
+          </p>
+          <p className="approval-command-preview">{approvalSummaryForCard(approval)}</p>
+        </div>
+        {queueRemainder > 0 ? <span className="approval-queue-chip">{queueRemainder} queued</span> : null}
+      </div>
+
+      {checkpoint ? (
+        <div className="approval-checkpoint-sections">
+          {checkpoint.findings.length > 0 ? (
+            <ApprovalSection title="Findings" items={checkpoint.findings} />
+          ) : null}
+          {checkpoint.nextSteps.length > 0 ? (
+            <ApprovalSection title="Next steps" items={checkpoint.nextSteps} />
+          ) : null}
+          {checkpoint.commands.length > 0 ? (
+            <ApprovalSection title="Commands" items={checkpoint.commands} monospace />
+          ) : null}
+          {checkpoint.files.length > 0 ? <ApprovalSection title="Files" items={checkpoint.files} monospace /> : null}
+          {checkpoint.questionsForHuman.length > 0 ? (
+            <ApprovalSection title="Questions for you" items={checkpoint.questionsForHuman} />
+          ) : null}
+        </div>
+      ) : (
+        <details className="approval-payload-details">
+          <summary>Review payload</summary>
+          <pre>{JSON.stringify(approval.payload, null, 2)}</pre>
+        </details>
+      )}
+
+      <label className="approval-feedback-block">
+        <span>{checkpoint ? "Reviewer notes" : "Reason"}</span>
+        <Textarea
+          value={feedback}
+          onChange={(event) => onFeedbackChange(event.target.value)}
+          placeholder={
+            checkpoint
+              ? "Optional note for approval, or explain what should change before the next phase."
+              : "Optional reason for approval or rejection."
+          }
+          className="approval-feedback-textarea"
+          rows={3}
+        />
+      </label>
+
+      {editAllowed ? (
+        <div className="approval-edit-shell">
+          {!editMode ? (
+            <Button variant="outline" disabled={busy} onClick={() => onToggleEditMode(true)}>
+              Edit payload
+            </Button>
+          ) : (
+            <>
+              <label className="approval-feedback-block">
+                <span>Edited tool payload</span>
+                <Textarea
+                  value={editDraft}
+                  onChange={(event) => onEditDraftChange(event.target.value)}
+                  className="approval-json-textarea"
+                  rows={10}
+                />
+              </label>
+              <div className="approval-actions approval-actions-secondary">
+                <Button variant="outline" disabled={busy} onClick={() => onToggleEditMode(false)}>
+                  Cancel edit
+                </Button>
+                <Button variant="outline" disabled={busy} onClick={onSubmitEdit}>
+                  Submit edit
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+      ) : null}
+
+      <div className="approval-actions">
+        <Button variant="outline" disabled={busy} onClick={onReject}>
+          {checkpoint ? "Request changes" : "Reject"}
+        </Button>
+        <Button disabled={busy} onClick={onApprove}>
+          <Check data-icon="inline-start" />
+          {checkpoint ? "Approve checkpoint" : "Approve"}
+        </Button>
+      </div>
+    </article>
+  );
+}
+
+function ApprovalSection({
+  title,
+  items,
+  monospace = false,
+}: {
+  title: string;
+  items: string[];
+  monospace?: boolean;
+}) {
+  return (
+    <section className="approval-section">
+      <h4>{title}</h4>
+      <ul className={monospace ? "approval-mono-list" : ""}>
+        {items.map((item) => (
+          <li key={`${title}-${item}`}>{item}</li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function collectSpecialistSummaries(events: StreamEvent[]) {
+  const grouped = new Map<
+    string,
+    {
+      status: string;
+      latest: string;
+      count: number;
+    }
+  >();
+  for (const event of events) {
+    const explicit = readString(event.data.name);
+    const specialist = normalizeSpecialistSource(explicit) ?? normalizeSpecialistSource(event.source);
+    if (!specialist) continue;
+    const current = grouped.get(specialist) ?? { status: "", latest: "", count: 0 };
+    const nextStatus =
+      event.type === "subagent"
+        ? readString(event.data.status) || current.status
+        : current.status || (event.type === "error" ? "error" : "running");
+    const latest = summarizeTraceEvent(event) || current.latest;
+    grouped.set(specialist, { status: nextStatus, latest, count: current.count + 1 });
+  }
+  return [...grouped.entries()].map(([name, value]) => ({ name, ...value }));
+}
+
+function latestTodoSnapshot(events: StreamEvent[]): TodoItem[] {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type === "todo") {
+      return readTodoItems(event.data.items);
+    }
+  }
+  return [];
+}
+
+function RunOrchestrationTrace({ events, live = false }: { events: StreamEvent[]; live?: boolean }) {
+  const traceEvents = events.filter(isVisibleTraceEvent);
+  const specialistSummaries = collectSpecialistSummaries(traceEvents);
+  const todoItems = latestTodoSnapshot(events);
+
+  if (!traceEvents.length && !todoItems.length && !specialistSummaries.length) return null;
+
+  return (
+    <section className="timeline-trace-panel">
+      <div className="timeline-trace-header">
+        <span>{live ? "Agent activity" : "Run activity"}</span>
+        <span>{traceEvents.length > 0 ? `${traceEvents.length} event${traceEvents.length === 1 ? "" : "s"}` : "summary"}</span>
+      </div>
+      {todoItems.length > 0 && (
+        <div className="timeline-phase-list">
+          {todoItems.map((item) => (
+            <div key={item.id} className={`timeline-phase-chip ${item.status}`}>
+              <span>{item.text}</span>
+              <span>{item.status}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {specialistSummaries.length > 0 && (
+        <div className="timeline-specialist-grid">
+          {specialistSummaries.map((item) => (
+            <article key={item.name} className="timeline-specialist-card">
+              <header>
+                <span>{prettifySpecialistLabel(item.name)}</span>
+                <span>{item.status || "active"}</span>
+              </header>
+              <p>{item.latest || "Working."}</p>
+              <small>{item.count} event{item.count === 1 ? "" : "s"}</small>
+            </article>
+          ))}
+        </div>
+      )}
+      {traceEvents.length > 0 ? (
+        <details className="timeline-trace-details" open={false}>
+          <summary>{live ? "Technical trace" : "Trace details"}</summary>
+          <EventTimeline events={traceEvents} />
+        </details>
+      ) : null}
+    </section>
   );
 }
 

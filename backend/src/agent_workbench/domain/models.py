@@ -69,8 +69,9 @@ class GenerateTitleRequest(StrictModel):
 
 
 class InterruptDecision(StrictModel):
-    decision: Literal["approve", "reject"]
+    decision: Literal["approve", "reject", "edit"]
     reason: str | None = None
+    edited_action: dict[str, Any] | None = Field(default=None, alias="editedAction")
 
 
 class FileTreeNode(StrictModel):
@@ -124,4 +125,10 @@ class ApprovalRecord(StrictModel):
     interrupt_id: str = Field(alias="interruptId")
     tool: str
     payload: dict[str, Any] = Field(default_factory=dict)
-    status: Literal["pending", "approved", "rejected"] = "pending"
+    allowed_decisions: list[Literal["approve", "reject", "edit"]] = Field(
+        default_factory=lambda: ["approve", "reject"],
+        alias="allowedDecisions",
+    )
+    status: Literal["pending", "approved", "rejected", "edited"] = "pending"
+    reason: str | None = None
+    edited_action: dict[str, Any] | None = Field(default=None, alias="editedAction")

@@ -15,9 +15,9 @@ from dotenv import load_dotenv
 DEFAULT_TOKEN = "dev-local-token"
 DEFAULT_MODEL_ALLOWLIST = (
     "mock:deterministic",
+    "openai:accounts/fireworks/models/glm-4p7",
     "openai:accounts/fireworks/models/qwen3p6-plus",
     "openai:accounts/fireworks/models/kimi-k2-thinking",
-    "openai:accounts/fireworks/models/glm-4p7",
 )
 
 
@@ -57,7 +57,7 @@ def _ollama_models() -> tuple[str, ...]:
 
 
 def _default_model() -> str:
-    return os.getenv("WORKBENCH_DEFAULT_MODEL", "openai:accounts/fireworks/models/qwen3p6-plus")
+    return os.getenv("WORKBENCH_DEFAULT_MODEL", "openai:accounts/fireworks/models/glm-4p7")
 
 
 @dataclass(frozen=True)

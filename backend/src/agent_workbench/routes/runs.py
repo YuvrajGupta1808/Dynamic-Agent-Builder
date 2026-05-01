@@ -74,8 +74,20 @@ def decide_interrupt(
     payload: InterruptDecision,
     store: SessionStore = Depends(get_store),
 ) -> dict:
-    approval = store.decide_interrupt(run_id, interrupt_id, payload.decision)
-    submit_interrupt_decision(run_id, interrupt_id, payload.decision)
+    approval = store.decide_interrupt(run_id, interrupt_id, payload)
+    if payload.decision == "approve":
+        resume_payload = {"type": "approve"}
+    elif payload.decision == "edit":
+        resume_payload = {
+            "type": "edit",
+            "edited_action": payload.edited_action or {},
+        }
+    else:
+        resume_payload = {
+            "type": "reject",
+            "message": payload.reason or "User rejected this review checkpoint.",
+        }
+    submit_interrupt_decision(run_id, interrupt_id, resume_payload)
     return approval.model_dump(mode="json", by_alias=True)
 
 

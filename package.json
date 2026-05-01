@@ -4,7 +4,7 @@
   "packageManager": "pnpm@10.15.1",
   "scripts": {
     "dev": "concurrently -n backend,web -c cyan,green \"pnpm dev:backend\" \"pnpm dev:web\"",
-    "dev:backend": "WORKBENCH_DEFAULT_MODEL=openai:accounts/fireworks/models/qwen3p6-plus PYTHONPATH=backend/src .venv/bin/python -m uvicorn agent_workbench.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir backend/src --reload-exclude 'workspaces/*' --reload-exclude 'workspaces/**' --reload-exclude '.data/*' --reload-exclude '.data/**'",
+    "dev:backend": "WORKBENCH_DEFAULT_MODEL=openai:accounts/fireworks/models/glm-4p7 PYTHONPATH=backend/src .venv/bin/python -m uvicorn agent_workbench.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir backend/src --reload-exclude 'workspaces/*' --reload-exclude 'workspaces/**' --reload-exclude '.data/*' --reload-exclude '.data/**'",
     "dev:web": "VITE_API_BASE_URL=http://127.0.0.1:8000 pnpm --dir apps/web dev --host 127.0.0.1 --port 5173 --strictPort",
     "test": "pnpm test:backend && pnpm test:web",
     "test:backend": "PYTHONPATH=backend/src .venv/bin/python -m pytest backend/tests",

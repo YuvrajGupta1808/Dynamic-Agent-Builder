@@ -103,10 +103,18 @@ export function applyFile(sessionId: string, path: string, content: string) {
   });
 }
 
-export function decideInterrupt(runId: string, interruptId: string, decision: "approve" | "reject") {
+export function decideInterrupt(
+  runId: string,
+  interruptId: string,
+  payload: {
+    decision: "approve" | "reject" | "edit";
+    reason?: string;
+    editedAction?: Record<string, unknown>;
+  },
+) {
   return requestJson(`/api/runs/${runId}/interrupts/${interruptId}`, {
     method: "POST",
-    body: JSON.stringify({ decision }),
+    body: JSON.stringify(payload),
   });
 }
 

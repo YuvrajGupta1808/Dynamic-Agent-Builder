@@ -84,5 +84,8 @@ export interface ApprovalData {
   interruptId: string;
   tool: string;
   payload: Record<string, unknown>;
-  status: "pending" | "approved" | "rejected";
+  allowedDecisions?: Array<"approve" | "reject" | "edit">;
+  status: "pending" | "approved" | "rejected" | "edited";
+  reason?: string | null;
+  editedAction?: Record<string, unknown> | null;
 }

@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException, status
 
-from ..domain.models import ApprovalRecord, SessionRecord, SessionMode, WorkspaceMode
+from ..domain.models import ApprovalRecord, InterruptDecision, SessionRecord, SessionMode, WorkspaceMode
 
 
 def utc_now() -> str:
@@ -137,7 +137,7 @@ class SessionStore:
             )
         return approval
 
-    def decide_interrupt(self, run_id: str, interrupt_id: str, decision: str) -> ApprovalRecord:
+    def decide_interrupt(self, run_id: str, interrupt_id: str, decision: InterruptDecision) -> ApprovalRecord:
         with self._lock:
             row = self._conn.execute(
                 "SELECT payload FROM interrupts WHERE run_id = ? AND interrupt_id = ?",
@@ -146,7 +146,14 @@ class SessionStore:
         if not row:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interrupt not found")
         payload = json.loads(row["payload"])
-        payload["status"] = "approved" if decision == "approve" else "rejected"
+        if decision.decision == "approve":
+            payload["status"] = "approved"
+        elif decision.decision == "edit":
+            payload["status"] = "edited"
+            payload["editedAction"] = decision.edited_action
+        else:
+            payload["status"] = "rejected"
+        payload["reason"] = decision.reason
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE interrupts SET status = ?, payload = ?, decided_at = ? WHERE run_id = ? AND interrupt_id = ?",

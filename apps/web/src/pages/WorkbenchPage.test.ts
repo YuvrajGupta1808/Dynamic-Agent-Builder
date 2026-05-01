@@ -29,8 +29,8 @@ describe("WorkbenchPage approval helpers", () => {
 
 describe("WorkbenchPage mode labels", () => {
   it("formats mode labels for all session modes", () => {
-    expect(formatModeLabel("ask_before_edits")).toBe("mode ask before edits");
-    expect(formatModeLabel("accept_edits")).toBe("mode accept edits");
-    expect(formatModeLabel("accept_everything")).toBe("mode accept everything");
+    expect(formatModeLabel("ask_before_edits")).toBe("Ask before edits");
+    expect(formatModeLabel("accept_edits")).toBe("Accept edits");
+    expect(formatModeLabel("accept_everything")).toBe("Accept everything");
   });
 });

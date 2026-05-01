@@ -28,22 +28,44 @@ class InterruptDecisionBroker:
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
-        self._pending: dict[tuple[str, str], None] = {}
-        self._decisions: dict[tuple[str, str], str] = {}
+        self._pending: dict[tuple[str, str], dict[str, Any]] = {}
+        self._decisions: dict[tuple[str, str], Any] = {}
+        self._recent: dict[tuple[str, str, str], tuple[float, Any]] = {}
 
-    def register(self, run_id: str, interrupt_id: str) -> None:
+    def register(self, run_id: str, interrupt_id: str, *, tool: str = "", payload: dict[str, Any] | None = None) -> None:
         with self._cond:
-            self._pending[(run_id, interrupt_id)] = None
+            self._pending[(run_id, interrupt_id)] = {
+                "tool": tool,
+                "payload": dict(payload or {}),
+            }
             self._cond.notify_all()
 
-    def publish(self, run_id: str, interrupt_id: str, decision: str) -> bool:
+    def publish(self, run_id: str, interrupt_id: str, decision: Any) -> bool:
         with self._cond:
             key = (run_id, interrupt_id)
+            pending = self._pending.get(key) or {}
+            tool = str(pending.get("tool") or "")
+            payload = pending.get("payload")
+            if tool:
+                fingerprint = self._fingerprint(run_id, tool, payload if isinstance(payload, dict) else {})
+                self._recent[fingerprint] = (time.monotonic() + 30.0, decision)
             self._decisions[key] = decision
             self._cond.notify_all()
             return key in self._pending
 
-    def wait_for(self, run_id: str, interrupt_id: str, timeout_seconds: float) -> str | None:
+    def reuse_recent_decision(self, run_id: str, tool: str, payload: dict[str, Any] | None) -> Any | None:
+        key = self._fingerprint(run_id, tool, payload or {})
+        with self._cond:
+            recent = self._recent.get(key)
+            if recent is None:
+                return None
+            expires_at, decision = recent
+            if expires_at <= time.monotonic():
+                self._recent.pop(key, None)
+                return None
+            return decision
+
+    def wait_for(self, run_id: str, interrupt_id: str, timeout_seconds: float) -> Any | None:
         key = (run_id, interrupt_id)
         deadline = time.monotonic() + max(timeout_seconds, 1.0)
         with self._cond:
@@ -63,12 +85,22 @@ class InterruptDecisionBroker:
             for key in pending_keys:
                 self._pending.pop(key, None)
                 self._decisions.pop(key, None)
+            recent_keys = [key for key in self._recent if key[0] == run_id]
+            for key in recent_keys:
+                self._recent.pop(key, None)
+
+    @staticmethod
+    def _fingerprint(run_id: str, tool: str, payload: dict[str, Any]) -> tuple[str, str, str]:
+        normalized = dict(payload)
+        normalized.pop("_rawInterrupt", None)
+        payload_key = json.dumps(_safe_data(normalized), sort_keys=True, separators=(",", ":"))
+        return (run_id, tool, payload_key)
 
 
 INTERRUPT_BROKER = InterruptDecisionBroker()
 
 
-def submit_interrupt_decision(run_id: str, interrupt_id: str, decision: str) -> bool:
+def submit_interrupt_decision(run_id: str, interrupt_id: str, decision: Any) -> bool:
     """Publish user approval/rejection to an active stream worker."""
     return INTERRUPT_BROKER.publish(run_id, interrupt_id, decision)
 
@@ -154,6 +186,43 @@ def _source_from_ns(ns: Any) -> str:
         if isinstance(item, str) and item.startswith("tools:"):
             return item
     return ".".join(str(item) for item in ns)
+
+
+def _agent_name_from_mapping(mapping: Any) -> str | None:
+    if not isinstance(mapping, dict):
+        return None
+    candidate = mapping.get("lc_agent_name") or mapping.get("agent_name")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    return None
+
+
+def _agent_name_from_token(token: Any) -> str | None:
+    if isinstance(token, dict):
+        for value in (
+            token.get("metadata"),
+            token.get("response_metadata"),
+            token.get("additional_kwargs"),
+        ):
+            agent_name = _agent_name_from_mapping(value)
+            if agent_name:
+                return agent_name
+        return None
+    for attr in ("metadata", "response_metadata", "additional_kwargs"):
+        agent_name = _agent_name_from_mapping(getattr(token, attr, None))
+        if agent_name:
+            return agent_name
+    return None
+
+
+def _source_for_message(ns: Any, token: Any, metadata: Any | None = None) -> str:
+    metadata_agent = _agent_name_from_mapping(metadata)
+    if metadata_agent:
+        return metadata_agent
+    token_agent = _agent_name_from_token(token)
+    if token_agent:
+        return token_agent
+    return _source_from_ns(ns)
 
 
 def _message_content(token: Any) -> str:
@@ -300,24 +369,52 @@ def _collect_interrupt_payloads(value: Any) -> list[Any]:
     return payloads
 
 
-def _interrupt_payload_to_tool_and_args(raw_interrupt: Any) -> tuple[str, dict[str, Any]]:
+def _interrupt_payloads_to_requests(raw_interrupt: Any) -> list[dict[str, Any]]:
     # LangGraph interrupt objects often carry a `.value`; convert to plain data.
     interrupt_value = getattr(raw_interrupt, "value", raw_interrupt)
     if isinstance(interrupt_value, dict):
+        review_configs_raw = interrupt_value.get("review_configs")
+        review_config_map: dict[str, dict[str, Any]] = {}
+        if isinstance(review_configs_raw, list):
+            for review_config in review_configs_raw:
+                if not isinstance(review_config, dict):
+                    continue
+                action_name = review_config.get("action_name")
+                if isinstance(action_name, str) and action_name:
+                    review_config_map[action_name] = review_config
         action_requests = interrupt_value.get("action_requests")
         if isinstance(action_requests, list) and action_requests:
-            first = action_requests[0]
-            if isinstance(first, dict):
-                tool_name = str(first.get("name") or "execute")
-                args = first.get("args")
+            prepared: list[dict[str, Any]] = []
+            for action_request in action_requests:
+                if not isinstance(action_request, dict):
+                    continue
+                tool_name = str(action_request.get("name") or "execute")
+                args = action_request.get("args")
+                review_config = review_config_map.get(tool_name, {})
+                raw_allowed_decisions = review_config.get("allowed_decisions")
+                allowed_decisions = ["approve", "edit", "reject"]
+                if isinstance(raw_allowed_decisions, list):
+                    normalized = [str(item) for item in raw_allowed_decisions if str(item) in {"approve", "edit", "reject"}]
+                    if normalized:
+                        allowed_decisions = normalized
                 if isinstance(args, dict):
-                    return tool_name, dict(args)
-                return tool_name, {"rawArgs": _safe_data(args)}
+                    payload = dict(args)
+                else:
+                    payload = {"rawArgs": _safe_data(args)}
+                prepared.append(
+                    {
+                        "tool": tool_name,
+                        "payload": payload,
+                        "allowedDecisions": allowed_decisions,
+                        "rawInterrupt": _safe_data(interrupt_value),
+                    }
+                )
+            return prepared
         tool = str(interrupt_value.get("tool") or "execute")
         payload = interrupt_value.get("payload")
         if isinstance(payload, dict):
-            return tool, payload
-    return "execute", {"rawInterrupt": _safe_data(interrupt_value)}
+            return [{"tool": tool, "payload": payload, "allowedDecisions": ["approve", "reject"], "rawInterrupt": _safe_data(interrupt_value)}]
+    return [{"tool": "execute", "payload": {"rawInterrupt": _safe_data(interrupt_value)}, "allowedDecisions": ["approve", "reject"], "rawInterrupt": _safe_data(interrupt_value)}]
 
 
 # Read-only shell commands that are safe to auto-approve when the workbench is
@@ -370,16 +467,19 @@ def _attach_interrupts_to_chunk(chunk: Any) -> tuple[Any, list[dict[str, Any]]]:
         return chunk, []
     prepared: list[dict[str, Any]] = []
     for raw in raw_interrupts:
-        tool, payload = _interrupt_payload_to_tool_and_args(raw)
-        prepared.append(
-            {
-                "interruptId": uuid4().hex,
-                "tool": tool,
-                "payload": payload,
-                "rawInterrupt": _safe_data(getattr(raw, "value", raw)),
-                "autoApprove": _can_auto_approve(tool, payload),
-            }
-        )
+        for request in _interrupt_payloads_to_requests(raw):
+            tool = str(request.get("tool") or "execute")
+            payload = dict(request.get("payload") or {})
+            prepared.append(
+                {
+                    "interruptId": uuid4().hex,
+                    "tool": tool,
+                    "payload": payload,
+                    "allowedDecisions": list(request.get("allowedDecisions") or ["approve", "reject"]),
+                    "rawInterrupt": request.get("rawInterrupt"),
+                    "autoApprove": _can_auto_approve(tool, payload),
+                }
+            )
     enriched_chunk = dict(chunk)
     enriched_chunk["_workbench_interrupts"] = prepared
     return enriched_chunk, prepared
@@ -431,6 +531,7 @@ def normalize_chunk(
                 interruptId=interrupt_id,
                 tool=tool,
                 payload=payload,
+                allowedDecisions=list(pending.get("allowedDecisions") or ["approve", "reject"]),
             )
             store.create_interrupt(approval)
             events.append(
@@ -444,6 +545,8 @@ def normalize_chunk(
 
     if chunk_type == "messages" and isinstance(data, tuple) and data:
         token = data[0]
+        metadata = data[1] if len(data) > 1 else {}
+        source = _source_for_message(ns, token, metadata)
         for tool_call in _tool_call_chunks(token):
             if tool_call.get("name"):
                 events.append(
@@ -456,16 +559,21 @@ def normalize_chunk(
                 )
         thinking = _message_thinking(token)
         if thinking:
-            # LangGraph `stream_mode=["updates","messages",...]` delivers the same reasoning
-            # twice: incremental AIMessageChunks on `messages`, then consolidated state on
-            # `updates`. The UI showed both (spaced fragments + clean duplicate). When
-            # `emit_update_tokens` is False we are in that dual-stream layout—emit thinking
-            # only from the `updates` branch below.
+            # Dual-stream runs deliver reasoning in both `messages` and `updates`.
+            # When `emit_update_tokens` is False, prefer the canonical `updates`
+            # branch to avoid duplicate thinking cards.
             if emit_update_tokens:
-                events.append(sequencer.event("thinking", source=source, message=thinking, data={"metadata": data[1] if len(data) > 1 else {}}))
+                events.append(
+                    sequencer.event(
+                        "thinking",
+                        source=source,
+                        message=thinking,
+                        data={"metadata": metadata if isinstance(metadata, dict) else {}},
+                    )
+                )
         content = _message_content(token)
         if content and _token_type(token) != "tool":
-            events.append(sequencer.event("token", source=source, message=content, data={"metadata": data[1] if len(data) > 1 else {}}))
+            events.append(sequencer.event("token", source=source, message=content, data={"metadata": metadata if isinstance(metadata, dict) else {}}))
         elif _token_type(token) == "tool":
             events.append(sequencer.event("tool_call", source=source, message=str(content)[:500], data={"result": content}))
         return events
@@ -474,6 +582,7 @@ def normalize_chunk(
         extracted = False
         update_payload = data if isinstance(data, dict) else {}
         for message in _iter_messages_from_update(update_payload):
+            message_source = _source_for_message(ns, message)
             msg_type = _message_type(message)
             if msg_type not in {"ai", "assistant", "aimessage", "aimessagechunk"}:
                 continue
@@ -482,14 +591,14 @@ def normalize_chunk(
             reasoning = _message_thinking(message)
             tool_calls = _message_tool_calls(message)
             if reasoning:
-                events.append(sequencer.event("thinking", source=source, message=reasoning))
+                events.append(sequencer.event("thinking", source=message_source, message=reasoning))
                 extracted = True
             for tool_call in tool_calls:
                 if isinstance(tool_call, dict) and tool_call.get("name"):
                     events.append(
                         sequencer.event(
                             "tool_call",
-                            source=source,
+                            source=message_source,
                             message=f"Tool call: {tool_call.get('name')}",
                             data={"name": tool_call.get("name"), "args": tool_call.get("args", {})},
                         )
@@ -497,13 +606,13 @@ def normalize_chunk(
                     extracted = True
             text = _message_content(message)
             if text and emit_update_tokens:
-                events.append(sequencer.event("token", source=source, message=text))
+                events.append(sequencer.event("token", source=message_source, message=text))
                 extracted = True
             # Some reasoning models finish with reasoning summaries and no
             # explicit text block. Promote that terminal reasoning to token so
             # the UI always has a final visible assistant response.
             elif emit_update_tokens and reasoning and not tool_calls:
-                events.append(sequencer.event("token", source=source, message=reasoning))
+                events.append(sequencer.event("token", source=message_source, message=reasoning))
                 extracted = True
         if not extracted:
             events.append(sequencer.event("update", source=source, message="Graph update", data={"update": _safe_data(data)}))
@@ -514,7 +623,8 @@ def normalize_chunk(
         if custom_event == "todo":
             events.append(sequencer.event("todo", source=source, message="Todo list updated", data={"items": data.get("items", [])}))
         elif custom_event == "subagent":
-            events.append(sequencer.event("subagent", source=source, message=data.get("summary"), data=data))
+            subagent_source = str(data.get("name") or source)
+            events.append(sequencer.event("subagent", source=subagent_source, message=data.get("summary"), data=data))
         elif custom_event == "tool_call":
             events.append(sequencer.event("tool_call", source=source, message=f"Tool call: {data.get('name')}", data=data))
         elif custom_event == "file_change":
@@ -526,6 +636,7 @@ def normalize_chunk(
                 interruptId=interrupt_id,
                 tool=str(data.get("tool") or "unknown"),
                 payload=dict(data.get("payload") or {}),
+                allowedDecisions=list(data.get("allowedDecisions") or ["approve", "reject"]),
             )
             store.create_interrupt(approval)
             events.append(
@@ -551,6 +662,59 @@ def _safe_data(value: Any) -> Any:
         return value
     except TypeError:
         return json.loads(json.dumps(value, default=str))
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    return max(value, minimum)
+
+
+def _delegate_wait_state_from_event(event: StreamEvent) -> dict[str, str] | None:
+    if event.type == "subagent":
+        name = read_string_value(event.data.get("name")) or event.source or "specialist"
+        status = read_string_value(event.data.get("status")) or "running"
+        summary = read_string_value(event.data.get("summary")) or event.message or f"{name} is running"
+        return {"name": name, "status": status, "summary": summary}
+    if event.type != "tool_call":
+        return None
+    tool_name = read_string_value(event.data.get("name"))
+    if tool_name not in {"task", "start_async_task"}:
+        return None
+    args = event.data.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    name = read_string_value(args.get("subagent_type")) or read_string_value(args.get("name")) or "specialist"
+    summary = (
+        read_string_value(args.get("description"))
+        or read_string_value(args.get("task"))
+        or read_string_value(args.get("prompt"))
+        or f"{name} is running"
+    )
+    return {"name": name, "status": "running", "summary": summary}
+
+
+def _delegate_wait_cleared_by_event(event: StreamEvent, active_delegate: dict[str, str] | None) -> bool:
+    if active_delegate is None:
+        return False
+    delegate_name = active_delegate.get("name") or ""
+    if event.type == "subagent":
+        event_name = read_string_value(event.data.get("name")) or event.source
+        status = (read_string_value(event.data.get("status")) or "").lower()
+        if delegate_name and event_name == delegate_name and status in {"completed", "complete", "success", "error", "cancelled", "failed"}:
+            return True
+    if event.source == "main" and event.type in {"token", "thinking", "approval_required", "file_change", "todo"}:
+        return True
+    if event.type == "tool_call" and read_string_value(event.data.get("name")) not in {"task", "start_async_task"} and event.source == "main":
+        return True
+    return False
+
+
+def read_string_value(value: Any) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def stream_run(
@@ -583,19 +747,41 @@ def stream_run(
         return
 
     try:
-        ensure_session_store_seeded(get_langgraph_store(), session.id)
+        ensure_session_store_seeded(get_langgraph_store(), session.id, Path(session.cwd))
         agent = build_agent(context)
         stream_messages = messages_for_agent_run(request, workspace_name=context.cwd.name)
         saw_assistant_token = False
         last_reasoning_message = ""
         chunk_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
-        inactivity_warning_seconds = 45.0
-        stream_hard_timeout_seconds = max(float(command_timeout_seconds), inactivity_warning_seconds + 30.0)
-        queue_poll_seconds = 5.0
+        queue_poll_seconds = _env_float("WORKBENCH_STREAM_QUEUE_POLL_SECONDS", 5.0, 0.05)
+        inactivity_warning_seconds = _env_float("WORKBENCH_STREAM_IDLE_WARNING_SECONDS", 45.0, 0.05)
+        stream_hard_timeout_seconds = max(
+            _env_float(
+                "WORKBENCH_STREAM_HARD_TIMEOUT_SECONDS",
+                max(float(command_timeout_seconds), inactivity_warning_seconds + 30.0),
+                inactivity_warning_seconds + 0.05,
+            ),
+            inactivity_warning_seconds + 0.05,
+        )
+        delegate_warning_seconds = _env_float(
+            "WORKBENCH_STREAM_SUBAGENT_HEARTBEAT_SECONDS",
+            inactivity_warning_seconds,
+            0.05,
+        )
+        delegate_hard_timeout_seconds = max(
+            _env_float(
+                "WORKBENCH_STREAM_SUBAGENT_TIMEOUT_SECONDS",
+                max(stream_hard_timeout_seconds * 1.5, 180.0),
+                stream_hard_timeout_seconds,
+            ),
+            stream_hard_timeout_seconds,
+        )
         started_at = time.monotonic()
         last_chunk_at = started_at
         next_idle_warning_at = started_at + inactivity_warning_seconds
+        waiting_for_approval = threading.Event()
         updates_only_stream_mode = False
+        active_delegate: dict[str, str] | None = None
 
         def _pump_chunks() -> None:
             nonlocal updates_only_stream_mode
@@ -621,41 +807,93 @@ def stream_run(
                         )
                     saw_interrupt = False
                     interrupt_decisions: list[dict[str, Any]] = []
+                    decided_interrupt_ids: set[str] = set()
+                    decided_fingerprints: set[str] = set()
                     for chunk in chunks:
                         enriched_chunk, interrupts = _attach_interrupts_to_chunk(chunk)
                         for pending in interrupts:
                             if pending.get("autoApprove"):
                                 continue
-                            interrupt_id = str(pending.get("interruptId") or "")
-                            if not interrupt_id:
+                            tool_name = str(pending.get("tool") or "")
+                            payload = dict(pending.get("payload") or {})
+                            fingerprint = f"{tool_name}|{json.dumps(payload, sort_keys=True, default=str)}"
+                            if fingerprint in decided_fingerprints:
                                 continue
-                            INTERRUPT_BROKER.register(run_id, interrupt_id)
+                            interrupt_id = str(pending.get("interruptId") or "")
+                            if not interrupt_id or interrupt_id in decided_interrupt_ids:
+                                continue
+                            INTERRUPT_BROKER.register(
+                                run_id,
+                                interrupt_id,
+                                tool=tool_name,
+                                payload=payload,
+                            )
                         chunk_queue.put(("chunk", enriched_chunk))
                         if not interrupts:
                             continue
                         saw_interrupt = True
                         for pending in interrupts:
+                            interrupt_id = str(pending.get("interruptId") or "")
+                            if interrupt_id and interrupt_id in decided_interrupt_ids:
+                                continue
+                            tool_name = str(pending.get("tool") or "")
+                            payload = dict(pending.get("payload") or {})
+                            fingerprint = f"{tool_name}|{json.dumps(payload, sort_keys=True, default=str)}"
+                            if fingerprint in decided_fingerprints:
+                                if interrupt_id:
+                                    decided_interrupt_ids.add(interrupt_id)
+                                continue
                             if pending.get("autoApprove"):
                                 interrupt_decisions.append({"type": "approve"})
+                                decided_fingerprints.add(fingerprint)
+                                if interrupt_id:
+                                    decided_interrupt_ids.add(interrupt_id)
                                 continue
-                            interrupt_id = str(pending.get("interruptId") or "")
+                            reused_decision = INTERRUPT_BROKER.reuse_recent_decision(run_id, tool_name, payload)
+                            if reused_decision is not None:
+                                chunk_queue.put(
+                                    (
+                                        "chunk",
+                                        {
+                                            "type": "custom",
+                                            "ns": (),
+                                            "data": {
+                                                "event": "update",
+                                                "status": "reused_approval",
+                                                "tool": tool_name,
+                                                "message": f"Reused recent approval for {tool_name}",
+                                            },
+                                        },
+                                    )
+                                )
+                                interrupt_decisions.append(reused_decision)
+                                decided_fingerprints.add(fingerprint)
+                                if interrupt_id:
+                                    decided_interrupt_ids.add(interrupt_id)
+                                continue
                             if not interrupt_id:
                                 continue
+                            waiting_for_approval.set()
                             decision = INTERRUPT_BROKER.wait_for(
                                 run_id,
                                 interrupt_id,
                                 timeout_seconds=float(max(command_timeout_seconds, 30)),
                             )
+                            waiting_for_approval.clear()
                             if decision is None:
                                 raise TimeoutError(
                                     f"Timed out waiting for approval decision for interrupt {interrupt_id}."
                                 )
-                            if decision == "approve":
+                            if isinstance(decision, dict):
+                                interrupt_decisions.append(decision)
+                            elif decision == "approve":
                                 interrupt_decisions.append({"type": "approve"})
                             else:
                                 interrupt_decisions.append(
                                     {"type": "reject", "message": "User rejected this tool execution request."}
                                 )
+                            decided_fingerprints.add(fingerprint)
+                            decided_interrupt_ids.add(interrupt_id)
                     if not saw_interrupt:
                         break
                     next_input = Command(resume={"decisions": interrupt_decisions})
@@ -673,6 +911,56 @@ def stream_run(
                 now = time.monotonic()
                 idle_seconds = now - last_chunk_at
                 total_seconds = now - started_at
+                if waiting_for_approval.is_set():
+                    if now >= next_idle_warning_at:
+                        yield to_sse(
+                            sequencer.event(
+                                "update",
+                                message="Waiting for approval",
+                                data={"status": "waiting_for_approval", "idleSeconds": int(idle_seconds)},
+                            )
+                        )
+                        next_idle_warning_at = now + inactivity_warning_seconds
+                    continue
+                if active_delegate and worker.is_alive():
+                    if now >= next_idle_warning_at:
+                        delegate_name = active_delegate.get("name") or "specialist"
+                        delegate_summary = active_delegate.get("summary") or f"{delegate_name} is still running"
+                        yield to_sse(
+                            sequencer.event(
+                                "subagent",
+                                source=delegate_name,
+                                message=delegate_summary,
+                                data={
+                                    "name": delegate_name,
+                                    "status": active_delegate.get("status") or "running",
+                                    "summary": delegate_summary,
+                                    "waiting": True,
+                                    "idleSeconds": int(idle_seconds),
+                                    "elapsedSeconds": int(total_seconds),
+                                },
+                            )
+                        )
+                        next_idle_warning_at = now + delegate_warning_seconds
+                    if total_seconds >= delegate_hard_timeout_seconds:
+                        timeout_message = (
+                            f"Subagent stalled: no stream events received for {int(idle_seconds)}s while waiting on "
+                            f"{active_delegate.get('name') or 'a delegated task'}."
+                        )
+                        yield to_sse(
+                            sequencer.event(
+                                "error",
+                                message=timeout_message,
+                                data={
+                                    "errorType": "SubagentStalledTimeout",
+                                    "delegate": active_delegate.get("name"),
+                                },
+                            )
+                        )
+                        yield to_sse(sequencer.event("done", message="Run terminated after subagent stall timeout"))
+                        store.finish_run(run_id, "error")
+                        return
+                    continue
                 if now >= next_idle_warning_at:
                     yield to_sse(
                         sequencer.event(
@@ -706,6 +994,11 @@ def stream_run(
                 store,
                 emit_update_tokens=updates_only_stream_mode,
             ):
+                if _delegate_wait_cleared_by_event(event, active_delegate):
+                    active_delegate = None
+                delegate_state = _delegate_wait_state_from_event(event)
+                if delegate_state is not None:
+                    active_delegate = delegate_state
                 if event.type == "token" and (event.message or "").strip():
                     saw_assistant_token = True
                 if event.type == "thinking" and (event.message or "").strip():

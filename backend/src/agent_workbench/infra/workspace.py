@@ -127,7 +127,18 @@ class WorkspaceManager:
         readme = root / "README.md"
         if not readme.exists():
             readme.write_text(
-                f"# {root.name}\n\nThis managed workspace is isolated from the main repository by default.\n",
+                (
+                    f"# {root.name}\n\n"
+                    "This managed workspace starts minimal. The Deep Agent should create project files, docs, skills, and Guild agent folders only when the user request calls for them.\n\n"
+                    "Expected build flow:\n"
+                    "1. Decompose the requested Guild system and choose templates with written justification.\n"
+                    "2. Stop for an architecture checkpoint review before moving deeper into implementation.\n"
+                    "3. Set up only the files and folders that are actually needed.\n"
+                    "4. Adapt generated scaffolds to the real use case.\n"
+                    "5. Run local validation before any publish or workspace install step.\n"
+                    "6. Stop for a pre-publish checkpoint review before any publish or workspace install step.\n"
+                    "7. Record validation and post-publish observations in workspace docs when the task is substantial.\n"
+                ),
                 encoding="utf-8",
             )
         return root

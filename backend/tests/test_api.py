@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from agent_workbench.api import create_app
 from agent_workbench.core.config import get_settings
 from agent_workbench.core.dependencies import get_store, get_workspace_manager
+from agent_workbench.domain.models import ApprovalRecord
 
 
 def client_for(tmp_path: Path, monkeypatch) -> TestClient:
@@ -54,8 +55,8 @@ def test_create_session_and_stream(tmp_path: Path, monkeypatch) -> None:
 
     tree_response = client.get(f"/api/sessions/{session_id}/files/tree", headers=auth_headers())
     assert tree_response.status_code == 200
-    children = tree_response.json().get("children") or []
-    assert children and children[0]["name"] == "README.md"
+    children = {child["name"] for child in tree_response.json().get("children") or []}
+    assert children == {"README.md"}
 
     with client.stream(
         "POST",
@@ -91,3 +92,60 @@ def test_managed_workspace_create_and_session(tmp_path: Path, monkeypatch) -> No
     )
     assert session_response.status_code == 200
     assert session_response.json()["cwd"].endswith("/workspaces/_local/Client-App")
+
+
+def test_workspace_bootstrap_starts_minimal(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+
+    workspace_response = client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    assert workspace_response.status_code == 200
+    root = Path(workspace_response.json()["path"])
+
+    assert (root / "README.md").read_text(encoding="utf-8").startswith("# support-suite")
+    assert not (root / "AGENTS.md").exists()
+    assert not (root / "WORKSPACE_CONTEXT.md").exists()
+    assert not (root / "skills").exists()
+    assert not (root / "agents").exists()
+
+
+def test_interrupt_decision_route_supports_edit(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+    store = get_store()
+    store.create_interrupt(
+        ApprovalRecord(
+            runId="run-1",
+            interruptId="intr-1",
+            tool="request_checkpoint_review",
+            payload={
+                "phase": "architecture_review",
+                "summary": "Two-agent design is ready.",
+                "findings": ["billing and escalation split cleanly"],
+                "next_steps": ["scaffold the chosen agents"],
+            },
+            allowedDecisions=["approve", "edit", "reject"],
+        )
+    )
+
+    response = client.post(
+        "/api/runs/run-1/interrupts/intr-1",
+        headers=auth_headers(),
+        json={
+            "decision": "edit",
+            "reason": "Tighten the summary before moving on.",
+            "editedAction": {
+                "name": "request_checkpoint_review",
+                "args": {
+                    "phase": "architecture_review",
+                    "summary": "Single frontline agent plus escalation path is ready for review.",
+                    "findings": ["one LLM agent handles FAQs", "escalation stays explicit"],
+                    "next_steps": ["write the shared context", "scaffold the chosen agent"],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "edited"
+    assert body["reason"] == "Tighten the summary before moving on."
+    assert body["editedAction"]["name"] == "request_checkpoint_review"
