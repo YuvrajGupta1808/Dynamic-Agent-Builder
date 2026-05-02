@@ -56,7 +56,7 @@ def test_create_session_and_stream(tmp_path: Path, monkeypatch) -> None:
     tree_response = client.get(f"/api/sessions/{session_id}/files/tree", headers=auth_headers())
     assert tree_response.status_code == 200
     children = {child["name"] for child in tree_response.json().get("children") or []}
-    assert children == {"README.md"}
+    assert children == {"README.md", "agents"}
 
     with client.stream(
         "POST",
@@ -101,11 +101,172 @@ def test_workspace_bootstrap_starts_minimal(tmp_path: Path, monkeypatch) -> None
     assert workspace_response.status_code == 200
     root = Path(workspace_response.json()["path"])
 
-    assert (root / "README.md").read_text(encoding="utf-8").startswith("# support-suite")
-    assert not (root / "AGENTS.md").exists()
-    assert not (root / "WORKSPACE_CONTEXT.md").exists()
-    assert not (root / "skills").exists()
-    assert not (root / "agents").exists()
+    assert (root / "README.md").is_file()
+    assert (root / "agents").is_dir()
+    assert (root / "agents" / "README.md").is_file()
+    assert {child.name for child in root.iterdir()} == {"README.md", "agents"}
+
+
+def test_workspace_layout_allows_top_level_markdown_files(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+
+    workspace_response = client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    root = Path(workspace_response.json()["path"])
+    root.joinpath("TEST_SUMMARY.md").write_text("# Summary\n", encoding="utf-8")
+
+    session_response = client.post(
+        "/api/sessions",
+        headers=auth_headers(),
+        json={
+            "workspace": "support-suite",
+            "workspaceMode": "local",
+            "mode": "accept_everything",
+            "model": "mock:deterministic",
+        },
+    )
+    assert session_response.status_code == 200
+
+
+def test_workspace_layout_rejects_disallowed_top_level_entries(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+
+    workspace_response = client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    root = Path(workspace_response.json()["path"])
+    root.joinpath("notes").mkdir()
+
+    session_response = client.post(
+        "/api/sessions",
+        headers=auth_headers(),
+        json={
+            "workspace": "support-suite",
+            "workspaceMode": "local",
+            "mode": "accept_everything",
+            "model": "mock:deterministic",
+        },
+    )
+    assert session_response.status_code == 409
+    detail = session_response.json()["detail"]
+    assert detail["status"] == "invalid"
+    assert detail["recoverable"] is False
+    assert detail["invalidEntries"] == ["notes/"]
+    assert "agents/" in detail["allowedTopLevelEntries"]
+    assert "*.md" in detail["allowedTopLevelEntries"]
+
+
+def test_workspace_health_reports_recoverable_runtime_artifacts(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+    workspace_response = client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    root = Path(workspace_response.json()["path"])
+    root.joinpath("guild.json").write_text('{"agent_id":"abc"}', encoding="utf-8")
+    artifact_dir = root / "large_tool_results"
+    artifact_dir.mkdir()
+    artifact_dir.joinpath("chatcmpl-tool-1").write_text("large output", encoding="utf-8")
+
+    health = client.get("/api/workspaces/support-suite/health", headers=auth_headers())
+    assert health.status_code == 200
+    body = health.json()
+    assert body["status"] == "invalid"
+    assert body["recoverable"] is True
+    assert sorted(body["invalidEntries"]) == ["guild.json", "large_tool_results/"]
+    assert body["repairAvailable"] is True
+
+
+def test_workspace_repair_moves_known_legacy_artifacts(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+    workspace_response = client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    root = Path(workspace_response.json()["path"])
+    root.joinpath("guild.json").write_text('{"agent_id":"abc"}', encoding="utf-8")
+    artifact_dir = root / "large_tool_results"
+    artifact_dir.mkdir()
+    artifact_dir.joinpath("chatcmpl-tool-1").write_text("large output", encoding="utf-8")
+
+    repaired = client.post("/api/workspaces/support-suite/repair", headers=auth_headers())
+    assert repaired.status_code == 200
+    body = repaired.json()
+    assert body["status"] == "valid"
+    assert sorted(body["repairedEntries"]) == ["guild.json", "large_tool_results/"]
+    assert sorted(child.name for child in root.iterdir()) == ["README.md", "agents"]
+
+    session_response = client.post(
+        "/api/sessions",
+        headers=auth_headers(),
+        json={
+            "workspace": "support-suite",
+            "workspaceMode": "local",
+            "mode": "accept_everything",
+            "model": "mock:deterministic",
+        },
+    )
+    assert session_response.status_code == 200
+
+
+def test_workspace_apply_rejects_manual_scaffolding_outside_agents_root(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+    client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    session_response = client.post(
+        "/api/sessions",
+        headers=auth_headers(),
+        json={
+            "workspace": "support-suite",
+            "workspaceMode": "local",
+            "mode": "accept_everything",
+            "model": "mock:deterministic",
+        },
+    )
+    session_id = session_response.json()["id"]
+    blocked = client.post(
+        f"/api/sessions/{session_id}/files/apply",
+        headers=auth_headers(),
+        json={"path": "notes.txt", "content": "blocked"},
+    )
+    assert blocked.status_code == 403
+    assert "Writes are restricted" in blocked.json()["detail"]
+
+
+def test_workspace_apply_allows_top_level_markdown_files(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+    client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    session_response = client.post(
+        "/api/sessions",
+        headers=auth_headers(),
+        json={
+            "workspace": "support-suite",
+            "workspaceMode": "local",
+            "mode": "accept_everything",
+            "model": "mock:deterministic",
+        },
+    )
+    session_id = session_response.json()["id"]
+    ok = client.post(
+        f"/api/sessions/{session_id}/files/apply",
+        headers=auth_headers(),
+        json={"path": "TEST_SUMMARY.md", "content": "# ok\n"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["path"] == "TEST_SUMMARY.md"
+
+
+def test_workspace_apply_allows_agent_code_inside_agents_root(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+    client.post("/api/workspaces", headers=auth_headers(), json={"name": "support-suite"})
+    session_response = client.post(
+        "/api/sessions",
+        headers=auth_headers(),
+        json={
+            "workspace": "support-suite",
+            "workspaceMode": "local",
+            "mode": "accept_everything",
+            "model": "mock:deterministic",
+        },
+    )
+    session_id = session_response.json()["id"]
+    ok = client.post(
+        f"/api/sessions/{session_id}/files/apply",
+        headers=auth_headers(),
+        json={"path": "agents/refunds-agent/index.ts", "content": "export const ok = true;\n"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["path"] == "agents/refunds-agent/index.ts"
 
 
 def test_interrupt_decision_route_supports_edit(tmp_path: Path, monkeypatch) -> None:

@@ -24,6 +24,20 @@ export interface WorkspaceSummary {
   created?: boolean;
 }
 
+export interface WorkspaceHealth {
+  name: string;
+  path: string;
+  status: "valid" | "invalid";
+  recoverable: boolean;
+  repairAvailable: boolean;
+  invalidEntries: string[];
+  recoverableEntries: string[];
+  blockingEntries: string[];
+  allowedTopLevelEntries: string[];
+  message: string;
+  repairedEntries: string[];
+}
+
 export interface SessionRecord {
   id: string;
   cwd: string;
@@ -69,6 +83,7 @@ export interface StreamEvent {
     | "subagent"
     | "file_change"
     | "approval_required"
+    | "blocked_command"
     | "error"
     | "done";
   runId: string;

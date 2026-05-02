@@ -16,6 +16,7 @@ from langgraph.types import Command
 
 from ..domain.agents import AgentSessionContext, build_agent
 from ..domain.models import ApprovalRecord, RunStreamRequest, SessionRecord, StreamEvent
+from ..infra.command_policy import BlockedCommandError, GuildExecutionContext, evaluate_execute_request
 from ..infra.deep_agent_resources import ensure_session_store_seeded, get_langgraph_store
 from ..infra.session_store import SessionStore
 
@@ -156,7 +157,10 @@ def _workspace_context_message(workspace_name: str) -> dict[str, Any]:
         "content": (
             f"Workspace cwd: {workspace_name} (virtual root). "
             "Filesystem tools resolve relative paths under this workspace; "
-            "do not call pwd or use host-absolute paths to write workspace files."
+            "do not call pwd or use host-absolute paths to write workspace files. "
+            "Track three scopes explicitly: local builder workspace `/`, local agent repo `/agents/<agent-name>/`, "
+            "and selected remote Guild workspace metadata. Never run `guild agent init` at `/`; run it only inside "
+            "`/agents/<agent-name>/` or with `--directory agents/<agent-name>`."
         ),
     }
 
@@ -186,6 +190,30 @@ def _source_from_ns(ns: Any) -> str:
         if isinstance(item, str) and item.startswith("tools:"):
             return item
     return ".".join(str(item) for item in ns)
+
+
+def _specialist_from_source(source: str) -> str | None:
+    if not source:
+        return None
+    if source.startswith("tools:"):
+        candidate = source.split(":", 1)[1]
+        return candidate or None
+    return source if source != "main" else "main"
+
+
+def _interrupt_specialist(source: str, current_specialist: str | None) -> str:
+    explicit = (current_specialist or "").strip()
+    if explicit:
+        return explicit
+    from_source = _specialist_from_source(source)
+    return from_source or "main"
+
+
+def _command_cwd_from_payload(payload: dict[str, Any], workspace_root: Path) -> Path:
+    raw_cwd = payload.get("cwd")
+    if isinstance(raw_cwd, str) and raw_cwd.strip():
+        return Path(raw_cwd)
+    return workspace_root
 
 
 def _agent_name_from_mapping(mapping: Any) -> str | None:
@@ -491,6 +519,8 @@ def normalize_chunk(
     store: SessionStore,
     *,
     emit_update_tokens: bool = True,
+    workspace_root: Path | None = None,
+    current_specialist: str | None = None,
 ) -> list[StreamEvent]:
     if not isinstance(chunk, dict):
         return [sequencer.event("update", message=str(chunk), data={"raw": repr(chunk)[:1000]})]
@@ -510,6 +540,31 @@ def normalize_chunk(
             payload = dict(pending.get("payload") or {})
             if pending.get("rawInterrupt") is not None:
                 payload.setdefault("_rawInterrupt", pending.get("rawInterrupt"))
+            if tool == "execute" and workspace_root is not None:
+                specialist = _interrupt_specialist(source, current_specialist)
+                decision = evaluate_execute_request(
+                    GuildExecutionContext(
+                        specialist=specialist,
+                        command=str(payload.get("command") or payload.get("cmd") or ""),
+                        workspace_root=workspace_root,
+                        current_cwd=_command_cwd_from_payload(payload, workspace_root),
+                    )
+                )
+                if not decision.allowed:
+                    INTERRUPT_BROKER.publish(
+                        sequencer.run_id,
+                        interrupt_id,
+                        {"type": "reject", "message": decision.reason},
+                    )
+                    events.append(
+                        sequencer.event(
+                            "blocked_command",
+                            source=decision.specialist,
+                            message=decision.reason,
+                            data=decision.as_event(),
+                        )
+                    )
+                    continue
             if pending.get("autoApprove"):
                 command_preview = str(payload.get("command") or payload.get("cmd") or "")[:200]
                 events.append(
@@ -629,6 +684,17 @@ def normalize_chunk(
             events.append(sequencer.event("tool_call", source=source, message=f"Tool call: {data.get('name')}", data=data))
         elif custom_event == "file_change":
             events.append(sequencer.event("file_change", source=source, message=data.get("summary"), data=data))
+        elif custom_event == "blocked_command":
+            specialist = str(data.get("specialist") or source)
+            command = str(data.get("command") or "")
+            events.append(
+                sequencer.event(
+                    "blocked_command",
+                    source=specialist,
+                    message=f"Blocked command: {command}".rstrip(),
+                    data=data,
+                )
+            )
         elif custom_event == "approval_required":
             interrupt_id = str(data.get("interruptId") or uuid4().hex)
             approval = ApprovalRecord(
@@ -782,6 +848,8 @@ def stream_run(
         waiting_for_approval = threading.Event()
         updates_only_stream_mode = False
         active_delegate: dict[str, str] | None = None
+        max_tool_calls_per_run = max(1, int(_env_float("WORKBENCH_STREAM_MAX_TOOL_CALLS", 1200.0, 1.0)))
+        tool_call_count = 0
 
         def _pump_chunks() -> None:
             nonlocal updates_only_stream_mode
@@ -993,12 +1061,84 @@ def stream_run(
                 sequencer,
                 store,
                 emit_update_tokens=updates_only_stream_mode,
+                workspace_root=context.cwd,
+                current_specialist=active_delegate["name"] if active_delegate is not None else None,
             ):
+                cleared_delegate: dict[str, str] | None = None
+                if event.type == "tool_call":
+                    tool_call_count += 1
+                    if tool_call_count > max_tool_calls_per_run:
+                        yield to_sse(
+                            sequencer.event(
+                                "error",
+                                message=(
+                                    f"Run terminated after exceeding tool-call budget "
+                                    f"({max_tool_calls_per_run})."
+                                ),
+                                data={
+                                    "errorType": "ToolCallBudgetExceeded",
+                                    "toolCalls": tool_call_count,
+                                    "budget": max_tool_calls_per_run,
+                                },
+                            )
+                        )
+                        yield to_sse(sequencer.event("done", message="Run terminated after tool-call budget"))
+                        store.finish_run(run_id, "error")
+                        return
                 if _delegate_wait_cleared_by_event(event, active_delegate):
+                    cleared_delegate = dict(active_delegate) if active_delegate is not None else None
                     active_delegate = None
                 delegate_state = _delegate_wait_state_from_event(event)
                 if delegate_state is not None:
                     active_delegate = delegate_state
+                    yield to_sse(
+                        sequencer.event(
+                            "subagent",
+                            source=delegate_state.get("name") or "specialist",
+                            message=delegate_state.get("summary") or "Delegated task started",
+                            data={
+                                "name": delegate_state.get("name") or "specialist",
+                                "status": "started",
+                                "summary": delegate_state.get("summary") or "Delegated task started",
+                                "fromEvent": event.type,
+                            },
+                        )
+                    )
+                if (
+                    event.source != "main"
+                    and not str(event.source).startswith("tools:")
+                    and event.type in {"token", "thinking", "tool_call"}
+                ):
+                    progress_message = read_string_value(event.message) or f"{event.source} is running"
+                    yield to_sse(
+                        sequencer.event(
+                            "subagent",
+                            source=event.source,
+                            message=progress_message[:240],
+                            data={
+                                "name": event.source,
+                                "status": "running",
+                                "summary": progress_message[:240],
+                                "fromEvent": event.type,
+                            },
+                        )
+                    )
+                if cleared_delegate is not None:
+                    delegate_name = cleared_delegate.get("name") or "specialist"
+                    delegate_summary = cleared_delegate.get("summary") or f"{delegate_name} completed"
+                    yield to_sse(
+                        sequencer.event(
+                            "subagent",
+                            source=delegate_name,
+                            message=delegate_summary,
+                            data={
+                                "name": delegate_name,
+                                "status": "completed",
+                                "summary": delegate_summary,
+                                "fromEvent": event.type,
+                            },
+                        )
+                    )
                 if event.type == "token" and (event.message or "").strip():
                     saw_assistant_token = True
                 if event.type == "thinking" and (event.message or "").strip():
@@ -1009,6 +1149,15 @@ def stream_run(
         yield to_sse(sequencer.event("done", message="Run complete"))
         store.finish_run(run_id, "complete")
     except Exception as exc:
+        if isinstance(exc, BlockedCommandError):
+            yield to_sse(
+                sequencer.event(
+                    "blocked_command",
+                    source=exc.decision.specialist,
+                    message=exc.decision.reason,
+                    data=exc.decision.as_event(),
+                )
+            )
         yield to_sse(sequencer.event("error", message=str(exc), data={"errorType": type(exc).__name__}))
         store.finish_run(run_id, "error")
     finally:

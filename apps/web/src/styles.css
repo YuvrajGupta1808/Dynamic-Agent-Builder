@@ -1101,31 +1101,20 @@ p,
   color: hsl(220 12% 84%);
   font-size: 13px;
   line-height: 1.5;
-  white-space: pre-wrap;
-}
-
-.timeline-rich-text span {
-  white-space: pre-wrap;
-}
-
-.rich-markdownish {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.rich-markdownish p {
-  margin: 0;
 }
 
 .timeline-card .markdown-content {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .timeline-card .markdown-content > * {
   margin: 0;
+}
+
+.timeline-card .markdown-content p + p {
+  margin-top: 0.65rem;
 }
 
 .timeline-card .markdown-content ul,
@@ -1195,7 +1184,6 @@ p,
   font-size: 12.5px;
   line-height: 1.58;
   margin: 0;
-  white-space: pre-wrap;
   word-break: normal;
   overflow-wrap: break-word;
 }
@@ -1247,6 +1235,20 @@ p,
   line-height: 1.45;
 }
 
+.timeline-card.subagent,
+.timeline-card.approval {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
+
+.timeline-card.subagent p,
+.timeline-card.approval p,
+.timeline-plain-text p {
+  white-space: pre-wrap;
+}
+
 .timeline-card.tool {
   border: 0;
   background: transparent;
@@ -1272,6 +1274,10 @@ p,
   background: hsl(0 45% 16%);
 }
 
+.timeline-card.error pre {
+  color: hsl(0 0% 96%);
+}
+
 .timeline-card.assistant {
   border: 0;
   background: transparent;
@@ -1279,15 +1285,17 @@ p,
   padding: 0;
 }
 
-.timeline-card.assistant.live {
-  box-shadow: none;
-}
-
 .timeline-run-group {
   width: 100%;
   display: flex;
   flex-direction: column;
   gap: 9px;
+}
+
+.timeline-plain-text {
+  color: hsl(220 10% 72%);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .timeline-trace-panel {
@@ -1300,6 +1308,42 @@ p,
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.timeline-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.timeline-summary-card {
+  border: 1px solid hsl(220 10% 22%);
+  background: hsl(222 12% 15%);
+  border-radius: 12px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.timeline-summary-card.active {
+  border-color: hsl(200 70% 30%);
+}
+
+.timeline-summary-card.blocked {
+  border-color: hsl(20 75% 34%);
+  background: hsl(18 45% 16%);
+}
+
+.timeline-summary-card.complete {
+  border-color: hsl(140 45% 26%);
+}
+
+.timeline-summary-label {
+  color: hsl(220 8% 56%);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .timeline-trace-header {
@@ -1412,25 +1456,23 @@ p,
 }
 
 .timeline-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
+  display: block;
+  border: 1px solid hsl(220 10% 22%);
+  background: hsl(222 12% 14%);
+  border-radius: 12px;
+  padding: 10px;
 }
 
-.timeline-icon {
-  width: 14px;
-  height: 14px;
-  color: hsl(220 10% 60%);
-  margin-top: 3px;
-  flex: 0 0 auto;
+.timeline-activity-row summary {
+  list-style: none;
+  cursor: pointer;
 }
 
 .timeline-body {
   min-width: 0;
-  flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
 }
 
 .timeline-title {
@@ -1443,7 +1485,39 @@ p,
   line-height: 1.4;
 }
 
-.timeline-body pre {
+.timeline-status-chip {
+  border: 1px solid hsl(220 10% 24%);
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: hsl(220 8% 66%);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.timeline-status-chip.blocked,
+.timeline-status-chip.error {
+  border-color: hsl(15 70% 36%);
+  color: hsl(18 90% 76%);
+}
+
+.timeline-status-chip.running,
+.timeline-status-chip.active {
+  border-color: hsl(200 70% 30%);
+  color: hsl(195 75% 74%);
+}
+
+.timeline-status-chip.completed,
+.timeline-status-chip.complete {
+  border-color: hsl(140 45% 26%);
+  color: hsl(140 58% 74%);
+}
+
+.timeline-body small {
+  color: hsl(220 8% 52%);
+  font-size: 11px;
+}
+
+.timeline-activity-row pre {
   margin: 0;
   border-radius: 10px;
   border: 1px solid hsl(220 11% 24%);
@@ -1454,6 +1528,22 @@ p,
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
+}
+
+.timeline-show-more {
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  color: hsl(220 10% 70%);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+
+@media (max-width: 900px) {
+  .timeline-summary-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .agent-composer {

@@ -32,6 +32,20 @@ class WorkspaceSummary(StrictModel):
     created: bool = False
 
 
+class WorkspaceHealth(StrictModel):
+    name: str
+    path: str
+    status: Literal["valid", "invalid"]
+    recoverable: bool = False
+    repair_available: bool = Field(default=False, alias="repairAvailable")
+    invalid_entries: list[str] = Field(default_factory=list, alias="invalidEntries")
+    recoverable_entries: list[str] = Field(default_factory=list, alias="recoverableEntries")
+    blocking_entries: list[str] = Field(default_factory=list, alias="blockingEntries")
+    allowed_top_level_entries: list[str] = Field(default_factory=list, alias="allowedTopLevelEntries")
+    message: str
+    repaired_entries: list[str] = Field(default_factory=list, alias="repairedEntries")
+
+
 class SessionRecord(StrictModel):
     id: str
     cwd: str
@@ -109,6 +123,7 @@ class StreamEvent(StrictModel):
         "subagent",
         "file_change",
         "approval_required",
+        "blocked_command",
         "error",
         "done",
     ]

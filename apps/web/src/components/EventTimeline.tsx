@@ -13,6 +13,7 @@ const icons = {
   subagent: Bot,
   file_change: FilePenLine,
   approval_required: CircleAlert,
+  blocked_command: CircleAlert,
   error: CircleAlert,
   done: CheckCircle2,
 };

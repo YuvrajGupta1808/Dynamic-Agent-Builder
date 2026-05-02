@@ -20,18 +20,17 @@ import {
     SquareTerminal,
     X,
 } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type RefObject } from "react";
 import ReactMarkdown from "react-markdown";
 import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import { Link } from "react-router-dom";
-import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
-import { EventTimeline } from "../components/EventTimeline";
 import { FileTree } from "../components/FileTree";
 import { Button } from "../components/ui/button";
 import { Textarea } from "../components/ui/textarea";
 import {
+    ApiError,
     applyFile,
     createSession,
     createWorkspace,
@@ -39,7 +38,9 @@ import {
     getConfig,
     getFileContent,
     getFileTree,
+    getWorkspaceHealth,
     getWorkspaces,
+    repairWorkspace,
     streamRun,
     transcribeAudio,
 } from "../lib/api";
@@ -54,39 +55,297 @@ import type {
     SessionRecord,
     StreamEvent,
     TodoItem,
+    WorkspaceHealth,
     WorkspaceSummary,
 } from "../types/api";
+
+export type RunBlockKind = "thinking" | "assistant" | "tool" | "subagent" | "approval" | "error";
+
+export type RunBlock = {
+  id: string;
+  kind: RunBlockKind;
+  text: string;
+  eventType?: StreamEvent["type"] | "fallback_assistant";
+};
+
+type CompletedRun = {
+  id: string;
+  prompt: string;
+  promptImages: string[];
+  blocks: RunBlock[];
+  finalOutput: string;
+};
+
+type ImageAttachment = {
+  id: string;
+  name: string;
+  dataUrl: string;
+};
+
+type ChatThread = {
+  id: string;
+  title: string;
+  runs: CompletedRun[];
+  /** Backend session id + metadata; one per UI chat, lazy-created on first send. */
+  backendSession?: SessionRecord | null;
+};
+
+const WorkbenchEditorPane = memo(function WorkbenchEditorPane({
+  selectedPath,
+  workspaceBlocked,
+  workspaceMissing,
+  workspaceIssue,
+  hasUnsavedChanges,
+  isSaving,
+  saveLabel,
+  editorLanguage,
+  fileContent,
+  onFileContentChange,
+  onCloseFile,
+  onSaveFile,
+  onRepairWorkspace,
+  onOpenWorkspaceModal,
+  terminalLines,
+  terminalOutputRef,
+  terminalPanelRef,
+  onClearTerminal,
+  onToggleTerminal,
+}: {
+  selectedPath: string;
+  workspaceBlocked: boolean;
+  workspaceMissing: boolean;
+  workspaceIssue: WorkspaceHealth | null;
+  hasUnsavedChanges: boolean;
+  isSaving: boolean;
+  saveLabel: string;
+  editorLanguage: string;
+  fileContent: string;
+  onFileContentChange: (value: string) => void;
+  onCloseFile: () => void;
+  onSaveFile: () => void;
+  onRepairWorkspace: () => void;
+  onOpenWorkspaceModal: () => void;
+  terminalLines: string[];
+  terminalOutputRef: RefObject<HTMLPreElement | null>;
+  terminalPanelRef: ReturnType<typeof usePanelRef>;
+  onClearTerminal: () => void;
+  onToggleTerminal: () => void;
+}) {
+  return (
+    <section className="workbench-pane workbench-pane-fill">
+      <header className="editor-tabbar">
+        <div className="editor-tabs-row">
+          {selectedPath ? (
+            <div className="tab active editor-tab-with-close" role="presentation">
+              <FilePlus2 />
+              <span className="editor-tab-label">{selectedPath}</span>
+              <button type="button" className="editor-tab-close" aria-label="Close file" onClick={onCloseFile}>
+                <X />
+              </button>
+            </div>
+          ) : (
+            <span className="editor-tab-placeholder">
+              {workspaceBlocked ? "Workspace blocked" : workspaceMissing ? "Workspace" : "No file open"}
+            </span>
+          )}
+        </div>
+        <div className="editor-actions">
+          <Button
+            disabled={!selectedPath || !hasUnsavedChanges || isSaving || workspaceMissing || workspaceBlocked}
+            variant="ghost"
+            size="sm"
+            onClick={onSaveFile}
+            title={saveLabel}
+          >
+            <Save data-icon="inline-start" />
+            {saveLabel}
+          </Button>
+          {selectedPath ? (
+            <button type="button" className="editor-tab-close" aria-label="Close file" onClick={onCloseFile}>
+              <X />
+            </button>
+          ) : null}
+        </div>
+      </header>
+
+      <Group orientation="vertical" className="workbench-center-group" resizeTargetMinimumSize={{ coarse: 18, fine: 10 }}>
+        <Panel id="editorPanel" defaultSize="72%" minSize="38%" className="workbench-center-editor-panel">
+          <section className={`editor-area ${workspaceMissing || workspaceBlocked ? "editor-area-idle" : ""}`}>
+            {workspaceBlocked ? (
+              <WorkspaceIssueCard issue={workspaceIssue} busy={false} onRepair={onRepairWorkspace} />
+            ) : workspaceMissing ? (
+              <div className="workbench-empty-canvas">
+                <p className="workbench-empty-kicker">Getting started</p>
+                <h2 className="workbench-empty-heading">Create a workspace</h2>
+                <p className="workbench-empty-lead">
+                  You’ll get an isolated folder with a README, a file tree, and a safe place for the agent to work, nothing outside it
+                  unless you configure that.
+                </p>
+                <Button type="button" size="default" className="workbench-empty-cta" onClick={onOpenWorkspaceModal}>
+                  Get started
+                </Button>
+              </div>
+            ) : (
+              <Editor
+                height="100%"
+                language={editorLanguage}
+                theme="vs-dark"
+                value={fileContent}
+                onChange={(value) => onFileContentChange(value ?? "")}
+                options={{
+                  automaticLayout: true,
+                  fontFamily: "JetBrains Mono, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                  fontSize: 13,
+                  lineHeight: 21,
+                  minimap: { enabled: false },
+                  renderLineHighlight: "line",
+                  scrollBeyondLastLine: false,
+                  wordWrap: "on",
+                }}
+              />
+            )}
+          </section>
+        </Panel>
+
+        <Separator className="resize-handle resize-handle-vertical" />
+
+        <Panel
+          id="terminalPanel"
+          panelRef={terminalPanelRef}
+          collapsible
+          collapsedSize={0}
+          defaultSize="28%"
+          minSize="14%"
+          maxSize="55%"
+          className="workbench-center-terminal-panel"
+        >
+          <section className={`terminal-dock ${workspaceMissing || workspaceBlocked ? "terminal-dock-idle" : ""}`}>
+            <div className="terminal-header">
+              <div>
+                <SquareTerminal />
+                <span>Terminal</span>
+              </div>
+              <div className="terminal-actions">
+                <Button variant="ghost" size="sm" onClick={onClearTerminal}>
+                  Clear
+                </Button>
+                <Button variant="ghost" size="icon" type="button" title="Close terminal" onClick={onToggleTerminal}>
+                  <X />
+                </Button>
+              </div>
+            </div>
+            <pre className="terminal-output" ref={terminalOutputRef} tabIndex={-1}>
+              {terminalLines.join("\n")}
+            </pre>
+          </section>
+        </Panel>
+      </Group>
+    </section>
+  );
+});
+
+const AgentRunTimeline = memo(function AgentRunTimeline({
+  runs,
+  lastSubmittedPrompt,
+  liveRunBlocks,
+  isRunning,
+  approval,
+  pendingApprovalsCount,
+  approvalFeedback,
+  approvalEditDraft,
+  approvalEditMode,
+  isDecidingApproval,
+  onFeedbackChange,
+  onEditDraftChange,
+  onToggleEditMode,
+  onReject,
+  onApprove,
+  onSubmitEdit,
+}: {
+  runs: CompletedRun[];
+  lastSubmittedPrompt: string;
+  liveRunBlocks: RunBlock[];
+  isRunning: boolean;
+  approval: ApprovalData | null;
+  pendingApprovalsCount: number;
+  approvalFeedback: string;
+  approvalEditDraft: string;
+  approvalEditMode: boolean;
+  isDecidingApproval: boolean;
+  onFeedbackChange: (value: string) => void;
+  onEditDraftChange: (value: string) => void;
+  onToggleEditMode: (value: boolean) => void;
+  onReject: () => void;
+  onApprove: () => void;
+  onSubmitEdit: () => void;
+}) {
+  if (!runs.length && !lastSubmittedPrompt && liveRunBlocks.length === 0) {
+    return (
+      <div className="agent-empty-state">
+        <h3>How can I help you today?</h3>
+        <p>Ask anything or describe the edit you want to make.</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {runs.map((run) => (
+        <div key={run.id} className="timeline-run-group">
+          <article className="timeline-card user">
+            {renderMarkdownText(run.prompt)}
+            {run.promptImages.length > 0 && (
+              <div className="timeline-inline-images">
+                {run.promptImages.map((url) => (
+                  <img key={url} src={url} alt="User upload" className="timeline-inline-image" />
+                ))}
+              </div>
+            )}
+          </article>
+          {run.blocks.map((block) => renderRunBlock(block))}
+        </div>
+      ))}
+
+      {lastSubmittedPrompt ? (
+        <div className="timeline-run-group current-live-run">
+          <article className="timeline-card user">{renderMarkdownText(lastSubmittedPrompt)}</article>
+          {liveRunBlocks.map((block) => renderRunBlock(block))}
+          {isRunning && liveRunBlocks.length === 0 ? (
+            <article className="timeline-card thinking">
+              <p>Thinking...</p>
+            </article>
+          ) : null}
+          {approval ? (
+            <ApprovalReviewCard
+              approval={approval}
+              pendingCount={pendingApprovalsCount}
+              feedback={approvalFeedback}
+              editDraft={approvalEditDraft}
+              editMode={approvalEditMode}
+              busy={isDecidingApproval}
+              onFeedbackChange={onFeedbackChange}
+              onEditDraftChange={onEditDraftChange}
+              onToggleEditMode={onToggleEditMode}
+              onReject={onReject}
+              onApprove={onApprove}
+              onSubmitEdit={onSubmitEdit}
+            />
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  );
+});
+
+const TERMINAL_LINE_LIMIT = 400;
+const LIVE_FILE_REFRESH_DEBOUNCE_MS = 250;
+const LIVE_FILE_REFRESH_POLL_MS = 2000;
 
 export function WorkbenchPage() {
   const FIREWORKS_MODEL_OPTIONS = [
     "openai:accounts/fireworks/models/glm-4p7",
     "openai:accounts/fireworks/models/qwen3p6-plus",
   ] as const;
-  type ThinkingItem = {
-    id: string;
-    kind: "tool" | "thinking" | "error";
-    text: string;
-  };
-  type CompletedRun = {
-    id: string;
-    prompt: string;
-    promptImages: string[];
-    thinkingItems: ThinkingItem[];
-    events: StreamEvent[];
-    finalOutput: string;
-  };
-  type ImageAttachment = {
-    id: string;
-    name: string;
-    dataUrl: string;
-  };
-  type ChatThread = {
-    id: string;
-    title: string;
-    runs: CompletedRun[];
-    /** Backend session id + metadata; one per UI chat, lazy-created on first send. */
-    backendSession?: SessionRecord | null;
-  };
 
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
@@ -94,6 +353,7 @@ export function WorkbenchPage() {
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [session, setSession] = useState<SessionRecord | null>(null);
+  const [workspaceIssue, setWorkspaceIssue] = useState<WorkspaceHealth | null>(null);
   const [tree, setTree] = useState<FileTreeNode | null>(null);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
@@ -107,11 +367,8 @@ export function WorkbenchPage() {
   const [approvalEditDraft, setApprovalEditDraft] = useState("");
   const [approvalEditMode, setApprovalEditMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [thinkingItems, setThinkingItems] = useState<ThinkingItem[]>([]);
+  const [liveRunBlocks, setLiveRunBlocks] = useState<RunBlock[]>([]);
   const [lastSubmittedPrompt, setLastSubmittedPrompt] = useState("");
-  const [finalOutput, setFinalOutput] = useState("");
-  const [streamingAssistantText, setStreamingAssistantText] = useState("");
-  const [liveRunEvents, setLiveRunEvents] = useState<StreamEvent[]>([]);
   const [agentTitle, setAgentTitle] = useState("Agents");
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [selectedMode, setSelectedMode] = useState<SessionMode>("accept_edits");
@@ -128,10 +385,8 @@ export function WorkbenchPage() {
   const [activeThreadId, setActiveThreadId] = useState<string>("");
   const activeThread = chatThreads.find((thread) => thread.id === activeThreadId) ?? chatThreads[0];
   const approval = pendingApprovals[0] ?? null;
-  const streamBufferRef = useRef("");
   const structuredEventsSeenRef = useRef(false);
   const backendFailureRef = useRef(false);
-  const lastDerivedThinkingKeyRef = useRef("");
   const runInFlightRef = useRef(false);
   const didBootRef = useRef(false);
   const chatPaneRef = useRef<HTMLDivElement>(null);
@@ -140,6 +395,9 @@ export function WorkbenchPage() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<BlobPart[]>([]);
+  const liveRefreshDebounceRef = useRef<number | null>(null);
+  const liveRefreshPollRef = useRef<number | null>(null);
+  const streamFlushRafRef = useRef<number | null>(null);
   const explorerPanelRef = usePanelRef();
   const chatPanelRef = usePanelRef();
   const terminalPanelRef = usePanelRef();
@@ -151,6 +409,22 @@ export function WorkbenchPage() {
     if (!ta) return;
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, COMPOSER_TEXTAREA_MAX_PX)}px`;
+  }, []);
+
+  const appendTerminalLines = useCallback((lines: string[]) => {
+    if (!lines.length) return;
+    setTerminalLines((current) => [...current, ...lines].slice(-TERMINAL_LINE_LIMIT));
+  }, []);
+
+  const clearLiveWorkspaceRefresh = useCallback(() => {
+    if (liveRefreshDebounceRef.current !== null) {
+      window.clearTimeout(liveRefreshDebounceRef.current);
+      liveRefreshDebounceRef.current = null;
+    }
+    if (liveRefreshPollRef.current !== null) {
+      window.clearInterval(liveRefreshPollRef.current);
+      liveRefreshPollRef.current = null;
+    }
   }, []);
 
   const scrollChatToBottom = useCallback(() => {
@@ -174,6 +448,14 @@ export function WorkbenchPage() {
     didBootRef.current = true;
     void boot();
   }, []);
+
+  useEffect(() => () => {
+    clearLiveWorkspaceRefresh();
+    if (streamFlushRafRef.current !== null) {
+      cancelAnimationFrame(streamFlushRafRef.current);
+      streamFlushRafRef.current = null;
+    }
+  }, [clearLiveWorkspaceRefresh]);
 
   useEffect(() => {
     if (!activeThreadId && chatThreads.length) {
@@ -201,9 +483,7 @@ export function WorkbenchPage() {
     scrollChatToBottom();
   }, [
     scrollChatToBottom,
-    thinkingItems,
-    streamingAssistantText,
-    finalOutput,
+    liveRunBlocks,
     lastSubmittedPrompt,
     isRunning,
     activeThreadId,
@@ -213,6 +493,17 @@ export function WorkbenchPage() {
   useLayoutEffect(() => {
     scrollTerminalToBottom();
   }, [scrollTerminalToBottom, terminalLines]);
+
+  useEffect(() => {
+    clearLiveWorkspaceRefresh();
+    if (!isRunning || !session?.id || workspaceIssue) return;
+    liveRefreshPollRef.current = window.setInterval(() => {
+      void refreshWorkspace(session.id).catch((err) => {
+        setError(err instanceof Error ? err.message : "Unable to refresh workspace");
+      });
+    }, LIVE_FILE_REFRESH_POLL_MS);
+    return clearLiveWorkspaceRefresh;
+  }, [clearLiveWorkspaceRefresh, isRunning, session?.id, workspaceIssue]);
 
   const editorLanguage = useMemo(() => {
     if (selectedPath.endsWith(".py")) return "python";
@@ -240,6 +531,7 @@ export function WorkbenchPage() {
         const tid = crypto.randomUUID();
         setActiveWorkspace("");
         setSession(null);
+        setWorkspaceIssue(null);
         setTree(null);
         setSelectedPath("");
         setFileContent("");
@@ -250,8 +542,8 @@ export function WorkbenchPage() {
           "Welcome to Dynamic Agent Studio.",
           "Create a workspace (center panel) to open the editor, file tree, and agent.",
         ]);
+        setError(null);
       }
-      setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to initialize workspace");
     }
@@ -262,40 +554,7 @@ export function WorkbenchPage() {
     setWorkspaces(response.workspaces);
   }
 
-  async function openWorkspace(name: string, activeConfig = config) {
-    if (!activeConfig) return;
-    setActiveWorkspace(name);
-    setSelectedPath("");
-    setFileContent("");
-    setSavedContent("");
-    setThinkingItems([]);
-    setLastSubmittedPrompt("");
-    setFinalOutput("");
-    setStreamingAssistantText("");
-    setLiveRunEvents([]);
-    setPendingApprovals([]);
-    streamBufferRef.current = "";
-    structuredEventsSeenRef.current = false;
-    backendFailureRef.current = false;
-    lastDerivedThinkingKeyRef.current = "";
-    const firstThreadId = crypto.randomUUID();
-    setTerminalLines((current) => [...current, `$ workspace ${name}`]);
-    const modelForSession = selectedModel || activeConfig.defaultModel;
-    const created = await createSession({
-      workspace: name,
-      workspaceMode: "local",
-      mode: selectedMode,
-      model: modelForSession,
-    });
-    setChatThreads([{ id: firstThreadId, title: "Agents", runs: [], backendSession: created }]);
-    setActiveThreadId(firstThreadId);
-    setSession(created);
-    await refreshWorkspace(created.id);
-    await openWorkspaceReadme(created.id);
-    setError(null);
-  }
-
-  async function openWorkspaceReadme(sessionId: string) {
+  const openWorkspaceReadme = useCallback(async (sessionId: string) => {
     try {
       const readme = await getFileContent(sessionId, "README.md");
       setSelectedPath("README.md");
@@ -304,7 +563,7 @@ export function WorkbenchPage() {
     } catch {
       // Some pre-existing workspaces may not have a README; keep editor empty in that case.
     }
-  }
+  }, []);
 
   function generateRandomWorkspaceName() {
     const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -318,10 +577,10 @@ export function WorkbenchPage() {
     return name;
   }
 
-  function openWorkspaceModal() {
+  const openWorkspaceModal = useCallback(() => {
     setNewWorkspaceName(generateRandomWorkspaceName());
     setWorkspaceModalOpen(true);
-  }
+  }, []);
 
   function regenerateWorkspaceName() {
     setNewWorkspaceName(generateRandomWorkspaceName());
@@ -340,22 +599,120 @@ export function WorkbenchPage() {
     }
   }
 
-  async function refreshWorkspace(sessionId = session?.id) {
+  const refreshWorkspace = useCallback(async (sessionId = session?.id) => {
     if (!sessionId) return;
-    const nextTree = await getFileTree(sessionId);
-    setTree(nextTree);
+    try {
+      const nextTree = await getFileTree(sessionId);
+      setTree(nextTree);
+      setWorkspaceIssue(null);
+    } catch (err) {
+      const issue = workspaceIssueFromError(err);
+      if (issue) {
+        setWorkspaceIssue(issue);
+        setTree(null);
+        setError(issue.message);
+        return;
+      }
+      throw err;
+    }
+  }, [session?.id]);
+
+  const openWorkspace = useCallback(async (name: string, activeConfig = config) => {
+    if (!activeConfig) return;
+    setActiveWorkspace(name);
+    setWorkspaceIssue(null);
+    setSelectedPath("");
+    setFileContent("");
+    setSavedContent("");
+    setLiveRunBlocks([]);
+    setLastSubmittedPrompt("");
+    setPendingApprovals([]);
+    clearLiveWorkspaceRefresh();
+    structuredEventsSeenRef.current = false;
+    backendFailureRef.current = false;
+    setTree(null);
+    appendTerminalLines([`$ workspace ${name}`]);
+    try {
+      const health = await getWorkspaceHealth(name);
+      if (health.status === "invalid") {
+        setWorkspaceIssue(health);
+        setSession(null);
+        setError(health.message);
+        return;
+      }
+
+      const firstThreadId = crypto.randomUUID();
+      const modelForSession = selectedModel || activeConfig.defaultModel;
+      const created = await createSession({
+        workspace: name,
+        workspaceMode: "local",
+        mode: selectedMode,
+        model: modelForSession,
+      });
+      setChatThreads([{ id: firstThreadId, title: "Agents", runs: [], backendSession: created }]);
+      setActiveThreadId(firstThreadId);
+      setSession(created);
+      await refreshWorkspace(created.id);
+      await openWorkspaceReadme(created.id);
+      setError(null);
+    } catch (err) {
+      const issue = workspaceIssueFromError(err);
+      if (issue) {
+        setWorkspaceIssue(issue);
+        setSession(null);
+        setTree(null);
+        setError(issue.message);
+        return;
+      }
+      throw err;
+    }
+  }, [appendTerminalLines, clearLiveWorkspaceRefresh, config, openWorkspaceReadme, refreshWorkspace, selectedMode, selectedModel]);
+
+  function scheduleWorkspaceRefresh(sessionId = session?.id) {
+    if (!isRunning || !sessionId || workspaceIssue) return;
+    if (liveRefreshDebounceRef.current !== null) {
+      window.clearTimeout(liveRefreshDebounceRef.current);
+    }
+    liveRefreshDebounceRef.current = window.setTimeout(() => {
+      liveRefreshDebounceRef.current = null;
+      void refreshWorkspace(sessionId).catch((err) => {
+        setError(err instanceof Error ? err.message : "Unable to refresh workspace");
+      });
+    }, LIVE_FILE_REFRESH_DEBOUNCE_MS);
   }
 
-  async function selectFile(path: string) {
+  const repairActiveWorkspace = useCallback(async () => {
+    if (!activeWorkspace) return;
+    try {
+      const repaired = await repairWorkspace(activeWorkspace);
+      setWorkspaceIssue(repaired.status === "invalid" ? repaired : null);
+      appendTerminalLines([
+        repaired.repairedEntries.length
+          ? `[repair] moved ${repaired.repairedEntries.join(", ")}`
+          : "[repair] workspace already healthy",
+      ]);
+      if (repaired.status === "valid") {
+        await openWorkspace(activeWorkspace);
+      } else {
+        setError(repaired.message);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to repair workspace";
+      setError(message);
+      appendTerminalLines([`[error] ${message}`]);
+    }
+  }, [activeWorkspace, appendTerminalLines, openWorkspace]);
+
+  const selectFile = useCallback(async (path: string) => {
     if (!session) return;
     setSelectedPath(path);
     const content = await getFileContent(session.id, path);
     setFileContent(content.content);
     setSavedContent(content.content);
     setError(null);
-  }
+  }, [session]);
 
-  async function saveFile() {
+  const saveFile = useCallback(async () => {
     if (!session || !selectedPath) return;
     setIsSaving(true);
     try {
@@ -363,16 +720,21 @@ export function WorkbenchPage() {
       setFileContent(updated.content);
       setSavedContent(updated.content);
       await refreshWorkspace();
+      setWorkspaceIssue(null);
       setError(null);
-      setTerminalLines((current) => [...current, `[saved] ${selectedPath}`]);
+      appendTerminalLines([`[saved] ${selectedPath}`]);
     } catch (err) {
+      const issue = workspaceIssueFromError(err);
+      if (issue) {
+        setWorkspaceIssue(issue);
+      }
       const message = err instanceof Error ? err.message : "Unable to save file";
       setError(message);
-      setTerminalLines((current) => [...current, `[error] ${message}`]);
+      appendTerminalLines([`[error] ${message}`]);
     } finally {
       setIsSaving(false);
     }
-  }
+  }, [appendTerminalLines, fileContent, selectedPath, session, refreshWorkspace]);
 
   async function runAgent() {
     if (!config || isRunning || runInFlightRef.current) return;
@@ -400,33 +762,65 @@ export function WorkbenchPage() {
       setRecentPrompts((current) => [userPrompt, ...current.filter((p) => p !== userPrompt)].slice(0, 8));
     }
     setError(null);
-    setFinalOutput("");
-    setThinkingItems([]);
-    setStreamingAssistantText("");
-    setLiveRunEvents([]);
+    setLiveRunBlocks([]);
     setPendingApprovals([]);
-    streamBufferRef.current = "";
     structuredEventsSeenRef.current = false;
     backendFailureRef.current = false;
-    lastDerivedThinkingKeyRef.current = "";
-    setTerminalLines((current) => [...current, "", `$ agent ${userPrompt.slice(0, 90)}`]);
+    appendTerminalLines(["", `$ agent ${userPrompt.slice(0, 90)}`]);
     let latestReasoningText = "";
     let sawAssistantToken = false;
     let sawAnyEvent = false;
     let runFinalOutput = "";
     let latestErrorText = "";
-    let liveThinkingItems: ThinkingItem[] = [];
+    let nextBlocks: RunBlock[] = [];
     let liveEvents: StreamEvent[] = [];
-    const seenThinkingTexts = new Set<string>();
     const activeModel = selectedModel || config.defaultModel;
     const executeRun = async (sessionId: string, priorRuns: CompletedRun[]) => {
-      setChatThreads((current) =>
-        current.map((thread) =>
-          thread.id === threadIdAtSend && thread.runs.length === 0
-            ? { ...thread, title: provisionalTitle }
-            : thread,
-        ),
-      );
+      let queuedTerminalLines: string[] = [];
+      let queuedApprovals: ApprovalData[] = [];
+      let flushScheduled = false;
+
+      const flushLiveUpdates = () => {
+        flushScheduled = false;
+        streamFlushRafRef.current = null;
+        setLiveRunBlocks([...nextBlocks]);
+        if (queuedTerminalLines.length > 0) {
+          appendTerminalLines(queuedTerminalLines);
+          queuedTerminalLines = [];
+        }
+        if (queuedApprovals.length > 0) {
+          const incoming = queuedApprovals;
+          queuedApprovals = [];
+          setPendingApprovals((current) => {
+            const seen = new Set(current.map((item) => item.interruptId));
+            const merged = [...current];
+            for (const approvalItem of incoming) {
+              if (seen.has(approvalItem.interruptId)) continue;
+              seen.add(approvalItem.interruptId);
+              merged.push(approvalItem);
+            }
+            return merged;
+          });
+        }
+      };
+
+      const scheduleLiveFlush = () => {
+        if (flushScheduled) return;
+        flushScheduled = true;
+        streamFlushRafRef.current = requestAnimationFrame(() => {
+          flushLiveUpdates();
+        });
+      };
+
+      setChatThreads((current) => {
+        return current.map((thread) => {
+          if (thread.id === threadIdAtSend && thread.runs.length === 0) {
+            return { ...thread, title: provisionalTitle };
+          }
+          return thread;
+        });
+      });
+
       const transcriptMessages = priorRuns.flatMap((r) => [
         {
           role: "user" as const,
@@ -446,92 +840,63 @@ export function WorkbenchPage() {
               ),
             ]
           : userPrompt;
-      await streamRun(
-        sessionId,
-        {
-          message: userPrompt,
-          messages: [...transcriptMessages, { role: "user", content: currentUserContent }],
-          model: activeModel,
-          mode: selectedMode,
-        },
-        (event) => {
+
+      const handleStreamEvent = (event: StreamEvent) => {
         liveEvents = [...liveEvents, event];
-        setLiveRunEvents(liveEvents);
         sawAnyEvent = true;
+
         const terminalLine = terminalLineForEvent(event);
         if (terminalLine) {
-          setTerminalLines((current) => [...current, terminalLine]);
+          queuedTerminalLines.push(terminalLine);
         }
-        const thinkingText = thinkingLineForEvent(event);
-        if (thinkingText) {
-          const kind = thinkingKindForEvent(event);
-          if (kind === "thinking") {
-            const normalizedThinking = thinkingText.trim();
-            if (seenThinkingTexts.has(normalizedThinking)) {
-              return;
-            }
-            seenThinkingTexts.add(normalizedThinking);
-            latestReasoningText = normalizedThinking;
-          }
-          const last = liveThinkingItems[liveThinkingItems.length - 1];
-          if (kind === "thinking" && last && last.kind === "thinking") {
-            const joiner = last.text.endsWith(" ") || thinkingText.startsWith(" ") ? "" : " ";
-            liveThinkingItems = [
-              ...liveThinkingItems.slice(0, -1),
-              { ...last, text: `${last.text}${joiner}${thinkingText}`.trim() },
-            ];
-          } else if (!(last && last.kind === kind && last.text === thinkingText)) {
-            liveThinkingItems = [...liveThinkingItems, { id: crypto.randomUUID(), kind, text: thinkingText }];
-          }
-          setThinkingItems(liveThinkingItems);
-        }
-        if (
-          event.type === "thinking" ||
-          event.type === "tool_call" ||
-          event.type === "approval_required" ||
-          event.type === "file_change" ||
-          event.type === "todo" ||
-          event.type === "custom" ||
-          event.type === "update"
-        ) {
+        if (event.type !== "token") {
           structuredEventsSeenRef.current = true;
         }
+
+        const eventBlock = mapEventToRunBlock(event);
+        if (eventBlock) {
+          if (eventBlock.kind === "thinking") {
+            latestReasoningText = eventBlock.text;
+          }
+          nextBlocks = appendRunBlock(nextBlocks, eventBlock);
+        }
+
         if (event.type === "error") {
-          structuredEventsSeenRef.current = true;
           backendFailureRef.current = true;
-          const errText = (event.message || "Agent run failed").trim();
-          latestErrorText = errText;
-          // Keep error in the chat timeline only (thinking/tool cards); avoid duplicating in bottom banner.
+          latestErrorText = (event.message || "Agent run failed").trim();
         }
         if (event.type === "token" && event.message) {
           sawAssistantToken = true;
-          streamBufferRef.current += event.message;
-          setStreamingAssistantText(streamBufferRef.current);
+          nextBlocks = appendAssistantToken(nextBlocks, event.message);
         }
         if (event.type === "approval_required") {
-          const nextApproval = event.data as unknown as ApprovalData;
-          setPendingApprovals((current) => {
-            if (current.some((item) => item.interruptId === nextApproval.interruptId)) {
-              return current;
-            }
-            return [...current, nextApproval];
-          });
+          queuedApprovals.push(event.data as unknown as ApprovalData);
+        }
+        if (event.type === "file_change") {
+          scheduleWorkspaceRefresh(sessionId);
         }
         if (event.type === "done") {
-          if (streamBufferRef.current.trim()) {
-            setFinalOutput(streamBufferRef.current.trim());
-            runFinalOutput = streamBufferRef.current.trim();
-            streamBufferRef.current = "";
-            setStreamingAssistantText("");
+          const assistantTranscript = getAssistantTranscript(nextBlocks);
+          if (assistantTranscript) {
+            runFinalOutput = assistantTranscript;
           } else if (!sawAssistantToken && latestReasoningText.trim()) {
-            setFinalOutput(latestReasoningText.trim());
             runFinalOutput = latestReasoningText.trim();
           } else if (!runFinalOutput) {
             runFinalOutput = "Run completed without assistant text.";
-            setFinalOutput(runFinalOutput);
           }
         }
-      });
+
+        scheduleLiveFlush();
+      };
+
+      await streamRun(sessionId, {
+        message: userPrompt,
+        messages: [...transcriptMessages, { role: "user", content: currentUserContent }],
+        model: activeModel,
+        mode: selectedMode,
+      }, handleStreamEvent);
+
+      flushLiveUpdates();
       await refreshWorkspace(sessionId);
     };
 
@@ -556,35 +921,35 @@ export function WorkbenchPage() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Agent run failed";
       setError(message);
-      setTerminalLines((current) => [...current, `[error] ${message}`]);
-      const errorItem: ThinkingItem = { id: crypto.randomUUID(), kind: "error", text: message };
-      liveThinkingItems = [...liveThinkingItems, errorItem];
-      setThinkingItems((current) => [...current, errorItem]);
+      appendTerminalLines([`[error] ${message}`]);
+      nextBlocks = appendRunBlock(nextBlocks, { id: crypto.randomUUID(), kind: "error", text: message, eventType: "error" });
+      setLiveRunBlocks(nextBlocks);
       structuredEventsSeenRef.current = true;
       backendFailureRef.current = true;
       latestErrorText = message;
       runFinalOutput = "";
     } finally {
       runInFlightRef.current = false;
-      if (streamBufferRef.current.trim()) {
-        const full = streamBufferRef.current.trim();
-        setFinalOutput(full);
-        runFinalOutput = full;
-        if (!structuredEventsSeenRef.current && !backendFailureRef.current) {
-          const derived = extractThinkingAndToolsFromAssistantText(full);
-          lastDerivedThinkingKeyRef.current = derived.map((d) => `${d.kind}:${d.text}`).join("\n");
-          setThinkingItems(derived);
-          liveThinkingItems = derived;
-        }
-        streamBufferRef.current = "";
-        setStreamingAssistantText("");
+      clearLiveWorkspaceRefresh();
+      if (streamFlushRafRef.current !== null) {
+        cancelAnimationFrame(streamFlushRafRef.current);
+        streamFlushRafRef.current = null;
       }
-      if (!runFinalOutput && !liveThinkingItems.length) {
+      if (!structuredEventsSeenRef.current && !backendFailureRef.current) {
+        const fallbackAssistantText = getLatestAssistantText(nextBlocks).trim();
+        if (fallbackAssistantText) {
+          nextBlocks = extractRunBlocksFromAssistantText(fallbackAssistantText);
+          setLiveRunBlocks(nextBlocks);
+        }
+      }
+      if (!runFinalOutput) {
+        runFinalOutput = getAssistantTranscript(nextBlocks);
+      }
+      if (!runFinalOutput && !nextBlocks.length) {
         const fallback = sawAnyEvent
           ? "Run completed, but no assistant response text was returned."
           : "No stream events received from backend.";
         runFinalOutput = fallback;
-        setFinalOutput(fallback);
       }
       const safeFinalOutput = (runFinalOutput || latestReasoningText || "").trim();
       const dedupedFinalOutput = latestErrorText && safeFinalOutput === latestErrorText ? "" : safeFinalOutput;
@@ -593,8 +958,7 @@ export function WorkbenchPage() {
           id: crypto.randomUUID(),
           prompt: userPrompt,
           promptImages: activeImageAttachments.map((item) => item.dataUrl),
-          thinkingItems: liveThinkingItems,
-          events: liveEvents,
+          blocks: nextBlocks,
           finalOutput: dedupedFinalOutput || (latestErrorText ? "" : "No assistant response was returned for this run."),
         };
         setChatThreads((current) => {
@@ -609,33 +973,15 @@ export function WorkbenchPage() {
         });
       }
       setLastSubmittedPrompt("");
-      setThinkingItems([]);
-      setFinalOutput("");
-      setStreamingAssistantText("");
-      setLiveRunEvents([]);
+      setLiveRunBlocks([]);
       setIsRunning(false);
     }
   }
 
-  useEffect(() => {
-    // If the backend emitted structured thinking/tool events, we render those directly.
-    if (structuredEventsSeenRef.current) return;
-    if (backendFailureRef.current) return;
-    const text = streamingAssistantText || finalOutput;
-    if (!text) return;
-
-    const derived = extractThinkingAndToolsFromAssistantText(text);
-    const key = derived.map((d) => `${d.kind}:${d.text}`).join("\n");
-    if (!key) return;
-    if (key === lastDerivedThinkingKeyRef.current) return;
-    lastDerivedThinkingKeyRef.current = key;
-    setThinkingItems(derived);
-  }, [streamingAssistantText, finalOutput]);
-
-  async function handleApproval(
+  const handleApproval = useCallback(async (
     decision: "approve" | "reject" | "edit",
     options: { reason?: string; editedAction?: Record<string, unknown> } = {},
-  ) {
+  ) => {
     if (!approval) return;
     setIsDecidingApproval(true);
     try {
@@ -645,25 +991,25 @@ export function WorkbenchPage() {
         editedAction: options.editedAction,
       });
       const approvalLabel = approvalCheckpointLabel(approval);
-      setTerminalLines((current) => [...current, `[${decision}] ${approval.tool}${approvalLabel ? ` (${approvalLabel})` : ""}`]);
+      appendTerminalLines([`[${decision}] ${approval.tool}${approvalLabel ? ` (${approvalLabel})` : ""}`]);
       setPendingApprovals((current) => current.filter((item) => item.interruptId !== approval.interruptId));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to submit approval decision.");
     } finally {
       setIsDecidingApproval(false);
     }
-  }
+  }, [approval, appendTerminalLines]);
 
-  async function approveCurrentApproval() {
+  const approveCurrentApproval = useCallback(async () => {
     await handleApproval("approve");
-  }
+  }, [handleApproval]);
 
-  async function rejectCurrentApproval() {
+  const rejectCurrentApproval = useCallback(async () => {
     const reason = approvalFeedback.trim() || defaultRejectReason(approval);
     await handleApproval("reject", { reason });
-  }
+  }, [approval, approvalFeedback, handleApproval]);
 
-  async function submitEditedApproval() {
+  const submitEditedApproval = useCallback(async () => {
     if (!approval) return;
     try {
       const editedAction = parseEditedActionDraft(approvalEditDraft, approval);
@@ -674,7 +1020,7 @@ export function WorkbenchPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Invalid edited approval payload.");
     }
-  }
+  }, [approval, approvalEditDraft, approvalFeedback, handleApproval]);
 
   const hasUnsavedChanges = !!selectedPath && fileContent !== savedContent;
   const saveLabel = !selectedPath ? "Open a file to save" : isSaving ? "Saving..." : hasUnsavedChanges ? "Save" : "Saved";
@@ -697,9 +1043,7 @@ export function WorkbenchPage() {
   }
 
   function clearRunOutput() {
-    setFinalOutput("");
-    setStreamingAssistantText("");
-    setThinkingItems([]);
+    setLiveRunBlocks([]);
     setShowActions(false);
   }
 
@@ -789,16 +1133,16 @@ export function WorkbenchPage() {
     setShowActions(false);
   }
 
-  function toggleTerminal() {
+  const toggleTerminal = useCallback(() => {
     if (!terminalPanelRef.current) return;
     if (terminalPanelRef.current.isCollapsed()) {
       terminalPanelRef.current.expand();
       return;
     }
     terminalPanelRef.current.collapse();
-  }
+  }, [terminalPanelRef]);
 
-  function closeEditorTab() {
+  const closeEditorTab = useCallback(() => {
     if (!selectedPath) return;
     if (hasUnsavedChanges) {
       const ok = window.confirm("Discard unsaved changes for this file?");
@@ -807,9 +1151,23 @@ export function WorkbenchPage() {
     setSelectedPath("");
     setFileContent("");
     setSavedContent("");
-  }
+  }, [hasUnsavedChanges, selectedPath]);
 
   const workspaceMissing = workspaces.length === 0 || !session;
+  const workspaceBlocked = workspaceIssue !== null;
+
+  const clearTerminal = useCallback(() => {
+    setTerminalLines(
+      workspaceBlocked
+        ? [workspaceIssue?.message ?? "Workspace is blocked."]
+        : workspaceMissing
+          ? [
+              "Welcome to Dynamic Agent Studio.",
+              "Create a workspace (center panel) to open the editor, file tree, and agent.",
+            ]
+          : ["Agents terminal ready."],
+    );
+  }, [workspaceBlocked, workspaceIssue?.message, workspaceMissing]);
 
   return (
     <>
@@ -894,7 +1252,6 @@ export function WorkbenchPage() {
                       Dynamic Agent Studio
                     </Link>
                   </h1>
-                  <p>{config?.defaultModel ?? "Loading model"}</p>
                 </div>
                 <Button variant="ghost" size="icon" onClick={() => void boot()} title="Refresh">
                   <RefreshCw />
@@ -948,12 +1305,14 @@ export function WorkbenchPage() {
                     <RefreshCw />
                   </Button>
                 </div>
-                {workspaceMissing ? (
+                {workspaceBlocked ? (
+                  <WorkspaceIssueCard issue={workspaceIssue} busy={false} onRepair={() => void repairActiveWorkspace()} compact />
+                ) : workspaceMissing ? (
                   <div className="file-pane-idle">
                     <p>Files from your workspace will list here.</p>
                   </div>
                 ) : (
-                  <FileTree node={tree} selectedPath={selectedPath} onSelect={(path) => void selectFile(path)} />
+                  <FileTree node={tree} selectedPath={selectedPath} onSelect={selectFile} />
                 )}
               </section>
             </aside>
@@ -962,132 +1321,27 @@ export function WorkbenchPage() {
           <Separator className="resize-handle" />
 
           <Panel id="center" defaultSize="50%" minSize="36%" className="ide-panel-center">
-            <section className="workbench-pane workbench-pane-fill">
-              <header className="editor-tabbar">
-                <div className="editor-tabs-row">
-                  {selectedPath ? (
-                    <div className="tab active editor-tab-with-close" role="presentation">
-                      <FilePlus2 />
-                      <span className="editor-tab-label">{selectedPath}</span>
-                      <button
-                        type="button"
-                        className="editor-tab-close"
-                        aria-label="Close file"
-                        onClick={() => closeEditorTab()}
-                      >
-                        <X />
-                      </button>
-                    </div>
-                  ) : (
-                    <span className="editor-tab-placeholder">
-                      {workspaceMissing ? "Workspace" : "No file open"}
-                    </span>
-                  )}
-                </div>
-                <div className="editor-actions">
-                  <span className="editor-cwd-truncate">
-                    {workspaceMissing ? "Set up a workspace to continue" : (session?.cwd ?? "—")}
-                  </span>
-                  <Button
-                    disabled={!selectedPath || !hasUnsavedChanges || isSaving || workspaceMissing}
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => void saveFile()}
-                    title={saveLabel}
-                  >
-                    <Save data-icon="inline-start" />
-                    {saveLabel}
-                  </Button>
-                  <Button variant="ghost" size="icon" type="button" title="Toggle terminal" onClick={toggleTerminal}>
-                    <SquareTerminal />
-                  </Button>
-                </div>
-              </header>
-
-              <Group orientation="vertical" className="workbench-center-group" resizeTargetMinimumSize={{ coarse: 18, fine: 10 }}>
-                <Panel id="editorPanel" defaultSize="72%" minSize="38%" className="workbench-center-editor-panel">
-                  <section className={`editor-area ${workspaceMissing ? "editor-area-idle" : ""}`}>
-                    {workspaceMissing ? (
-                      <div className="workbench-empty-canvas">
-                        <p className="workbench-empty-kicker">Getting started</p>
-                        <h2 className="workbench-empty-heading">Create a workspace</h2>
-                        <p className="workbench-empty-lead">
-                          You’ll get an isolated folder with a README, a file tree, and a safe place for the agent to work—nothing
-                          outside it unless you configure that.
-                        </p>
-                        <Button type="button" size="default" className="workbench-empty-cta" onClick={openWorkspaceModal}>
-                          Get started
-                        </Button>
-                      </div>
-                    ) : (
-                      <Editor
-                        height="100%"
-                        language={editorLanguage}
-                        theme="vs-dark"
-                        value={fileContent}
-                        onChange={(value) => setFileContent(value ?? "")}
-                        options={{
-                          automaticLayout: true,
-                          fontFamily: "JetBrains Mono, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                          fontSize: 13,
-                          lineHeight: 21,
-                          minimap: { enabled: false },
-                          renderLineHighlight: "line",
-                          scrollBeyondLastLine: false,
-                          wordWrap: "on",
-                        }}
-                      />
-                    )}
-                  </section>
-                </Panel>
-
-                <Separator className="resize-handle resize-handle-vertical" />
-
-                <Panel
-                  id="terminalPanel"
-                  panelRef={terminalPanelRef}
-                  collapsible
-                  collapsedSize={0}
-                  defaultSize="28%"
-                  minSize="14%"
-                  maxSize="55%"
-                  className="workbench-center-terminal-panel"
-                >
-                  <section className={`terminal-dock ${workspaceMissing ? "terminal-dock-idle" : ""}`}>
-                    <div className="terminal-header">
-                      <div>
-                        <SquareTerminal />
-                        <span>Terminal</span>
-                      </div>
-                      <div className="terminal-actions">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() =>
-                            setTerminalLines(
-                              workspaceMissing
-                                ? [
-                                    "Welcome to Dynamic Agent Studio.",
-                                    "Create a workspace (center panel) to open the editor, file tree, and agent.",
-                                  ]
-                                : ["Agents terminal ready."],
-                            )
-                          }
-                        >
-                          Clear
-                        </Button>
-                        <Button variant="ghost" size="icon" type="button" title="Close terminal" onClick={toggleTerminal}>
-                          <X />
-                        </Button>
-                      </div>
-                    </div>
-                    <pre className="terminal-output" ref={terminalOutputRef} tabIndex={-1}>
-                      {terminalLines.join("\n")}
-                    </pre>
-                  </section>
-                </Panel>
-              </Group>
-            </section>
+            <WorkbenchEditorPane
+              selectedPath={selectedPath}
+              workspaceBlocked={workspaceBlocked}
+              workspaceMissing={workspaceMissing}
+              workspaceIssue={workspaceIssue}
+              hasUnsavedChanges={hasUnsavedChanges}
+              isSaving={isSaving}
+              saveLabel={saveLabel}
+              editorLanguage={editorLanguage}
+              fileContent={fileContent}
+              onFileContentChange={setFileContent}
+              onCloseFile={closeEditorTab}
+              onSaveFile={saveFile}
+              onRepairWorkspace={repairActiveWorkspace}
+              onOpenWorkspaceModal={openWorkspaceModal}
+              terminalLines={terminalLines}
+              terminalOutputRef={terminalOutputRef}
+              terminalPanelRef={terminalPanelRef}
+              onClearTerminal={clearTerminal}
+              onToggleTerminal={toggleTerminal}
+            />
           </Panel>
 
           <Separator className="resize-handle" />
@@ -1180,91 +1434,27 @@ export function WorkbenchPage() {
         <div className="agent-pane-body">
           <div className="agent-stage">
             <div className="agent-timeline" ref={chatPaneRef}>
-              {!activeThread?.runs.length && !lastSubmittedPrompt && thinkingItems.length === 0 && !streamingAssistantText && !finalOutput ? (
-                <div className="agent-empty-state">
-                  <h3>How can I help you today?</h3>
-                  <p>Ask anything or describe the edit you want to make.</p>
-                </div>
-              ) : (
-                <>
-                  {(activeThread?.runs ?? []).map((run) => (
-                    <div key={run.id} className="timeline-run-group">
-                      <article className="timeline-card user">
-                        {renderTextWithCodeFences(run.prompt)}
-                        {run.promptImages.length > 0 && (
-                          <div className="timeline-inline-images">
-                            {run.promptImages.map((url) => (
-                              <img key={url} src={url} alt="User upload" className="timeline-inline-image" />
-                            ))}
-                          </div>
-                        )}
-                      </article>
-                      {run.thinkingItems.map((entry) => (
-                        <article className={`timeline-card ${entry.kind}`} key={entry.id}>
-                          {entry.kind === "thinking" ? (
-                            renderTextWithCodeFences(entry.text, "preserveLines")
-                          ) : entry.kind === "tool" || entry.kind === "error" ? (
-                            <pre>{entry.text}</pre>
-                          ) : (
-                            <p>{entry.text}</p>
-                          )}
-                        </article>
-                      ))}
-                      <RunOrchestrationTrace events={run.events} />
-                      {run.finalOutput && <article className="timeline-card assistant">{renderTextWithCodeFences(run.finalOutput)}</article>}
-                    </div>
-                  ))}
-
-                  {lastSubmittedPrompt && (
-                    <div className="timeline-run-group current-live-run">
-                      <article className="timeline-card user">
-                        {renderTextWithCodeFences(lastSubmittedPrompt)}
-                      </article>
-                      {thinkingItems.map((entry) => (
-                        <article className={`timeline-card ${entry.kind}`} key={entry.id}>
-                          {entry.kind === "thinking" ? (
-                            renderTextWithCodeFences(entry.text, "preserveLines")
-                          ) : entry.kind === "tool" || entry.kind === "error" ? (
-                            <pre>{entry.text}</pre>
-                          ) : (
-                            <p>{entry.text}</p>
-                          )}
-                        </article>
-                      ))}
-                      <RunOrchestrationTrace events={liveRunEvents} live={isRunning} />
-                      {isRunning && thinkingItems.length === 0 && !streamingAssistantText && !finalOutput && (
-                        <article className="timeline-card thinking">
-                          <p>Thinking...</p>
-                        </article>
-                      )}
-                      {approval && (
-                        <ApprovalReviewCard
-                          approval={approval}
-                          pendingCount={pendingApprovals.length}
-                          feedback={approvalFeedback}
-                          editDraft={approvalEditDraft}
-                          editMode={approvalEditMode}
-                          busy={isDecidingApproval}
-                          onFeedbackChange={setApprovalFeedback}
-                          onEditDraftChange={setApprovalEditDraft}
-                          onToggleEditMode={setApprovalEditMode}
-                          onReject={() => void rejectCurrentApproval()}
-                          onApprove={() => void approveCurrentApproval()}
-                          onSubmitEdit={() => void submitEditedApproval()}
-                        />
-                      )}
-                      {streamingAssistantText && (
-                        <article className="timeline-card assistant live">
-                          {renderTextWithCodeFences(streamingAssistantText)}
-                        </article>
-                      )}
-                    </div>
-                  )}
-                </>
-              )}
+              <AgentRunTimeline
+                runs={activeThread?.runs ?? []}
+                lastSubmittedPrompt={lastSubmittedPrompt}
+                liveRunBlocks={liveRunBlocks}
+                isRunning={isRunning}
+                approval={approval}
+                pendingApprovalsCount={pendingApprovals.length}
+                approvalFeedback={approvalFeedback}
+                approvalEditDraft={approvalEditDraft}
+                approvalEditMode={approvalEditMode}
+                isDecidingApproval={isDecidingApproval}
+                onFeedbackChange={setApprovalFeedback}
+                onEditDraftChange={setApprovalEditDraft}
+                onToggleEditMode={setApprovalEditMode}
+                onReject={rejectCurrentApproval}
+                onApprove={approveCurrentApproval}
+                onSubmitEdit={submitEditedApproval}
+              />
             </div>
 
-            <section className={cn("agent-composer", workspaceMissing && "agent-composer-idle")}>
+            <section className={cn("agent-composer", (workspaceMissing || workspaceBlocked) && "agent-composer-idle")}>
               <input
                 ref={imageInputRef}
                 type="file"
@@ -1294,11 +1484,13 @@ export function WorkbenchPage() {
                   queueMicrotask(resizeComposerTextarea);
                 }}
                 placeholder={
-                  workspaceMissing
-                    ? "Create a workspace to start chatting with the agent…"
-                    : "Ask anything, @ to mention, / for workflows..."
+                  workspaceBlocked
+                    ? "Repair the workspace before chatting with the agent…"
+                    : workspaceMissing
+                      ? "Create a workspace to start chatting with the agent…"
+                      : "Ask anything, @ to mention, / for workflows..."
                 }
-                readOnly={workspaceMissing}
+                readOnly={workspaceMissing || workspaceBlocked}
                 rows={1}
                 onPaste={(event) => {
                   const clipboardFiles = Array.from(event.clipboardData?.files ?? []);
@@ -1389,7 +1581,7 @@ export function WorkbenchPage() {
                 <button
                   className="composer-primary-button"
                   type="button"
-                  disabled={isRunning || workspaceMissing || isTranscribingAudio}
+                  disabled={isRunning || workspaceMissing || workspaceBlocked || isTranscribingAudio}
                   onClick={() => {
                     if (hasPromptText || imageAttachments.length > 0) {
                       void runAgent();
@@ -1418,12 +1610,6 @@ export function WorkbenchPage() {
           </div>
         </div>
 
-        {error && (
-          <div className="error-callout">
-            <X />
-            <span>{error}</span>
-          </div>
-        )}
       </aside>
           </Panel>
         </Group>
@@ -1553,6 +1739,9 @@ function terminalLineForEvent(event: StreamEvent): string | null {
     const tool = readString(event.data.tool) || "tool";
     return `[approval required] ${approvalSummaryFromData(tool, event.data.payload)}`;
   }
+  if (event.type === "blocked_command") {
+    return `[blocked] ${event.message || formatData(event.data)}`;
+  }
   if (event.type === "file_change") {
     return `[file] ${event.message || formatData(event.data)}`;
   }
@@ -1579,6 +1768,23 @@ function formatData(value: unknown): string {
   }
 }
 
+function isWorkspaceHealth(value: unknown): value is WorkspaceHealth {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<WorkspaceHealth>;
+  return (
+    (candidate.status === "valid" || candidate.status === "invalid") &&
+    typeof candidate.message === "string" &&
+    Array.isArray(candidate.invalidEntries)
+  );
+}
+
+function workspaceIssueFromError(error: unknown): WorkspaceHealth | null {
+  if (error instanceof ApiError && isWorkspaceHealth(error.detail)) {
+    return error.detail;
+  }
+  return null;
+}
+
 export function readApprovalCommand(approval: ApprovalData | null): string {
   if (!approval) return "";
   const payload = approval.payload;
@@ -1602,65 +1808,113 @@ function approvalSummaryForCard(approval: ApprovalData | null): string {
   return "This action needs approval before the run can continue.";
 }
 
-function thinkingKindForEvent(event: StreamEvent): "tool" | "thinking" | "error" {
-  if (event.type === "error") return "error";
-  if (event.type === "tool_call") return "tool";
-  return "thinking";
+export function appendRunBlock(blocks: RunBlock[], next: RunBlock): RunBlock[] {
+  const last = blocks[blocks.length - 1];
+  if (!last || last.kind !== next.kind) {
+    return [...blocks, next];
+  }
+  const joiner = shouldUseSoftJoin(last.kind, last.text, next.text) ? " " : "\n";
+  return [
+    ...blocks.slice(0, -1),
+    {
+      ...last,
+      text: `${last.text}${joiner}${next.text}`.trim(),
+      eventType: next.eventType ?? last.eventType,
+    },
+  ];
 }
 
-function thinkingLineForEvent(event: StreamEvent): string | null {
-  if (event.type === "custom" || event.type === "update") return null;
+function shouldUseSoftJoin(kind: RunBlockKind, left: string, right: string): boolean {
+  if (kind === "assistant") return false;
+  if (kind === "thinking") {
+    return !left.includes("\n") && !right.includes("\n");
+  }
+  return false;
+}
+
+export function appendAssistantToken(blocks: RunBlock[], token: string): RunBlock[] {
+  const last = blocks[blocks.length - 1];
+  if (last?.kind === "assistant") {
+    return [...blocks.slice(0, -1), { ...last, text: `${last.text}${token}` }];
+  }
+  return [...blocks, { id: crypto.randomUUID(), kind: "assistant", text: token, eventType: "token" }];
+}
+
+export function getLatestAssistantText(blocks: RunBlock[]): string {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    if (blocks[index].kind === "assistant") return blocks[index].text;
+  }
+  return "";
+}
+
+function getAssistantTranscript(blocks: RunBlock[]): string {
+  return blocks
+    .filter((block) => block.kind === "assistant")
+    .map((block) => block.text)
+    .join("\n\n")
+    .trim();
+}
+
+export function mapEventToRunBlock(event: StreamEvent): RunBlock | null {
   if (event.type === "todo") {
-    const items = readTodoItems(event.data.items);
-    if (!items.length) return "Todo list updated";
-    const active = items.find((item) => item.status === "active");
-    return active ? `Working: ${active.text}` : `Todo: ${items.map((item) => item.text).join(", ")}`;
+    return null;
   }
   if (event.type === "subagent") {
     const name = readString(event.data.name) || prettifySpecialistLabel(event.source);
     const status = readString(event.data.status);
     const summary = event.message || readString(event.data.summary);
-    return [name, status, summary].filter(Boolean).join(" · ");
+    return {
+      id: crypto.randomUUID(),
+      kind: "subagent",
+      text: [name, status, summary].filter(Boolean).join(" · "),
+      eventType: "subagent",
+    };
   }
   if (event.type === "thinking") {
     const text = (event.message || "").replace(/\s+/g, " ").trim();
-    if (!text) return null;
-    if (/^graph update$/i.test(text)) return null;
-    return text;
+    if (!text || /^graph update$/i.test(text)) return null;
+    return { id: crypto.randomUUID(), kind: "thinking", text, eventType: "thinking" };
   }
   if (event.type === "tool_call") {
-    const tool = readString(event.data.name) || "tool";
-    const command =
-      typeof event.data.args === "object" && event.data.args && "command" in event.data.args
-        ? String((event.data.args as { command: unknown }).command)
-        : "";
-    if (command) return `$ ${command}`;
-    const output = readString(event.data.result).trim();
-    if (output && output.length < 80) return output;
-    return `Called ${tool}`;
+    return { id: crypto.randomUUID(), kind: "tool", text: summarizeToolBlock(event), eventType: "tool_call" };
   }
   if (event.type === "approval_required") {
     const tool = readString(event.data.tool) || "tool";
-    return `Approval required: ${approvalSummaryFromData(tool, event.data.payload)}`;
+    return {
+      id: crypto.randomUUID(),
+      kind: "approval",
+      text: `Approval required: ${approvalSummaryFromData(tool, event.data.payload)}`,
+      eventType: "approval_required",
+    };
+  }
+  if (event.type === "blocked_command") {
+    return {
+      id: crypto.randomUUID(),
+      kind: "error",
+      text: event.message || "Blocked command",
+      eventType: "blocked_command",
+    };
   }
   if (event.type === "file_change") {
-    return event.message || formatData(event.data) || "File changed";
+    return null;
   }
   if (event.type === "error") {
-    return event.message || formatData(event.data) || "Agent error";
+    return {
+      id: crypto.randomUUID(),
+      kind: "error",
+      text: event.message || formatData(event.data) || "Agent error",
+      eventType: "error",
+    };
   }
-  if (event.type === "done") return null;
+  if (event.type === "custom" || event.type === "update" || event.type === "done" || event.type === "token") return null;
   return null;
 }
 
-type RichTextMode = "reflow" | "preserveLines";
-
-function renderTextWithCodeFences(text: string, mode: RichTextMode = "reflow") {
-  const source = mode === "preserveLines" ? preserveSingleLineBreaks(text) : text;
+function renderMarkdownText(text: string) {
   return (
     <div className="timeline-rich-text markdown-content">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkBreaks]}
+        remarkPlugins={[remarkGfm]}
         components={{
           p: ({ children }) => <p>{children}</p>,
           pre: ({ children }) => <pre>{children}</pre>,
@@ -1688,9 +1942,54 @@ function renderTextWithCodeFences(text: string, mode: RichTextMode = "reflow") {
           blockquote: ({ children }) => <blockquote>{children}</blockquote>,
         }}
       >
-        {source}
+        {text}
       </ReactMarkdown>
     </div>
+  );
+}
+
+function renderPlainText(text: string) {
+  return (
+    <div className="timeline-plain-text">
+      <p>{text}</p>
+    </div>
+  );
+}
+
+function renderPreformattedText(text: string) {
+  return (
+    <div className="timeline-plain-text">
+      <pre>{text}</pre>
+    </div>
+  );
+}
+
+function renderRunBlock(block: RunBlock) {
+  if (block.kind === "assistant") {
+    return (
+      <article className="timeline-card assistant" key={block.id}>
+        {renderMarkdownText(block.text)}
+      </article>
+    );
+  }
+  if (block.kind === "tool") {
+    return (
+      <article className="timeline-card tool" key={block.id}>
+        {renderPreformattedText(block.text)}
+      </article>
+    );
+  }
+  if (block.kind === "error") {
+    return (
+      <article className="timeline-card error" key={block.id}>
+        {renderPreformattedText(block.text)}
+      </article>
+    );
+  }
+  return (
+    <article className={`timeline-card ${block.kind}`} key={block.id}>
+      {renderPlainText(block.text)}
+    </article>
   );
 }
 
@@ -1710,32 +2009,6 @@ function readTodoItems(value: unknown): TodoItem[] {
   });
 }
 
-const SPECIALIST_NAMES = new Set([
-  "decomposer",
-  "template_selector",
-  "agent_initializer",
-  "workspace_initializer",
-  "context_specialist",
-  "cli_specialist",
-  "sdk_specialist",
-  "integration_specialist",
-  "trigger_specialist",
-  "session_specialist",
-  "documentation_specialist",
-  "editor",
-  "tester",
-  "validator",
-  "publisher",
-  "async_tester",
-  "async_publisher",
-  "async_session_specialist",
-]);
-
-function normalizeSpecialistSource(source: string): string | null {
-  const cleaned = source.replace(/^tools:/, "").trim();
-  return SPECIALIST_NAMES.has(cleaned) ? cleaned : null;
-}
-
 function prettifySpecialistLabel(source: string): string {
   return source
     .replace(/^tools:/, "")
@@ -1747,33 +2020,22 @@ function prettifySpecialistLabel(source: string): string {
 
 function summarizeTraceEvent(event: StreamEvent): string {
   if (event.type === "subagent") {
-    return [readString(event.data.status), event.message || readString(event.data.summary)].filter(Boolean).join(" · ");
+    return summarizeSubagentEvent(event);
   }
   if (event.type === "tool_call") {
-    const command =
-      typeof event.data.args === "object" && event.data.args && "command" in event.data.args
-        ? String((event.data.args as { command: unknown }).command ?? "")
-        : "";
-    const name = readString(event.data.name) || "tool";
-    return command || name;
+    return summarizeToolEvent(event);
   }
   if (event.type === "file_change") return event.message || "File changed";
   if (event.type === "approval_required") return approvalSummaryForEvent(event);
   if (event.type === "todo") {
     const items = readTodoItems(event.data.items);
+    const active = items.find((item) => item.status === "active");
+    if (active) return `Active: ${active.text}`;
     return items.map((item) => `${item.status}: ${item.text}`).join(" | ");
   }
+  if (event.type === "update") return event.message || "Run updated";
+  if (event.type === "error") return event.message || "Run error";
   return event.message || "";
-}
-
-function isVisibleTraceEvent(event: StreamEvent): boolean {
-  return (
-    event.type === "subagent" ||
-    event.type === "tool_call" ||
-    event.type === "file_change" ||
-    event.type === "approval_required" ||
-    event.type === "error"
-  );
 }
 
 function approvalSummaryForEvent(event: StreamEvent): string {
@@ -1795,6 +2057,72 @@ function approvalSummaryFromData(tool: string, payload: unknown): string {
         ? String(payload.cmd ?? "")
         : "";
   return command ? `${tool}: ${command}` : tool;
+}
+
+function summarizeToolEvent(event: StreamEvent): string {
+  const name = readString(event.data.name) || "tool";
+  const args = isRecord(event.data.args) ? event.data.args : {};
+  const command = readString(args.command);
+  const result = readString(event.data.result).trim();
+  if (command && result) {
+    const compact = result.replace(/\s+/g, " ").trim();
+    return `${command} -> ${compact.length > 120 ? `${compact.slice(0, 117)}...` : compact}`;
+  }
+  if (command) return command;
+  if (result) return `${name} -> ${result.length > 120 ? `${result.slice(0, 117)}...` : result}`;
+  return name;
+}
+
+function summarizeSubagentEvent(event: StreamEvent): string {
+  const status = readString(event.data.status);
+  const summary = event.message || readString(event.data.summary);
+  return [status, summary].filter(Boolean).join(" · ");
+}
+
+function summarizeToolBlock(event: StreamEvent): string {
+  const name = readString(event.data.name) || "tool";
+  const args = isRecord(event.data.args) ? event.data.args : {};
+  const command = readString(args.command);
+  const result = readString(event.data.result).trim();
+  if (command && result) return `$ ${command}\n${result}`;
+  if (command) return `$ ${command}`;
+  if (result) return `${name}\n${result}`;
+  return name;
+}
+
+function WorkspaceIssueCard({
+  issue,
+  busy,
+  onRepair,
+  compact = false,
+}: {
+  issue: WorkspaceHealth | null;
+  busy: boolean;
+  onRepair: () => void;
+  compact?: boolean;
+}) {
+  if (!issue) return null;
+  return (
+    <div className={compact ? "file-pane-idle" : "workbench-empty-canvas"}>
+      {!compact ? <p className="workbench-empty-kicker">Workspace repair</p> : null}
+      <h2 className={compact ? "workspace-sidebar-hint-title" : "workbench-empty-heading"}>
+        {issue.repairAvailable ? "Workspace needs repair" : "Workspace blocked"}
+      </h2>
+      <p className={compact ? "workspace-sidebar-hint-text" : "workbench-empty-lead"}>{issue.message}</p>
+      {issue.invalidEntries.length > 0 ? (
+        <div className="timeline-plain-text">
+          <p>
+            Invalid entries: <strong>{issue.invalidEntries.join(", ")}</strong>
+          </p>
+        </div>
+      ) : null}
+      {issue.repairAvailable ? (
+        <Button type="button" size="default" className={compact ? undefined : "workbench-empty-cta"} onClick={onRepair} disabled={busy}>
+          {busy ? "Repairing..." : "Repair workspace"}
+        </Button>
+      ) : null}
+    </div>
+  );
 }
 
 function ApprovalReviewCard({
@@ -1948,134 +2276,51 @@ function ApprovalSection({
   );
 }
 
-function collectSpecialistSummaries(events: StreamEvent[]) {
-  const grouped = new Map<
-    string,
-    {
-      status: string;
-      latest: string;
-      count: number;
-    }
-  >();
-  for (const event of events) {
-    const explicit = readString(event.data.name);
-    const specialist = normalizeSpecialistSource(explicit) ?? normalizeSpecialistSource(event.source);
-    if (!specialist) continue;
-    const current = grouped.get(specialist) ?? { status: "", latest: "", count: 0 };
-    const nextStatus =
-      event.type === "subagent"
-        ? readString(event.data.status) || current.status
-        : current.status || (event.type === "error" ? "error" : "running");
-    const latest = summarizeTraceEvent(event) || current.latest;
-    grouped.set(specialist, { status: nextStatus, latest, count: current.count + 1 });
-  }
-  return [...grouped.entries()].map(([name, value]) => ({ name, ...value }));
-}
-
-function latestTodoSnapshot(events: StreamEvent[]): TodoItem[] {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.type === "todo") {
-      return readTodoItems(event.data.items);
-    }
-  }
-  return [];
-}
-
-function RunOrchestrationTrace({ events, live = false }: { events: StreamEvent[]; live?: boolean }) {
-  const traceEvents = events.filter(isVisibleTraceEvent);
-  const specialistSummaries = collectSpecialistSummaries(traceEvents);
-  const todoItems = latestTodoSnapshot(events);
-
-  if (!traceEvents.length && !todoItems.length && !specialistSummaries.length) return null;
-
-  return (
-    <section className="timeline-trace-panel">
-      <div className="timeline-trace-header">
-        <span>{live ? "Agent activity" : "Run activity"}</span>
-        <span>{traceEvents.length > 0 ? `${traceEvents.length} event${traceEvents.length === 1 ? "" : "s"}` : "summary"}</span>
-      </div>
-      {todoItems.length > 0 && (
-        <div className="timeline-phase-list">
-          {todoItems.map((item) => (
-            <div key={item.id} className={`timeline-phase-chip ${item.status}`}>
-              <span>{item.text}</span>
-              <span>{item.status}</span>
-            </div>
-          ))}
-        </div>
-      )}
-      {specialistSummaries.length > 0 && (
-        <div className="timeline-specialist-grid">
-          {specialistSummaries.map((item) => (
-            <article key={item.name} className="timeline-specialist-card">
-              <header>
-                <span>{prettifySpecialistLabel(item.name)}</span>
-                <span>{item.status || "active"}</span>
-              </header>
-              <p>{item.latest || "Working."}</p>
-              <small>{item.count} event{item.count === 1 ? "" : "s"}</small>
-            </article>
-          ))}
-        </div>
-      )}
-      {traceEvents.length > 0 ? (
-        <details className="timeline-trace-details" open={false}>
-          <summary>{live ? "Technical trace" : "Trace details"}</summary>
-          <EventTimeline events={traceEvents} />
-        </details>
-      ) : null}
-    </section>
-  );
-}
-
-function extractThinkingAndToolsFromAssistantText(text: string): Array<{ id: string; kind: "tool" | "thinking" | "error"; text: string }> {
-  // Heuristic fallback: Deep Agents sometimes streams “tool usage” as plain markdown text
-  // (code fences with shell commands), not as structured `tool_call`/`thinking` SSE events.
-  const items: Array<{ id: string; kind: "tool" | "thinking" | "error"; text: string }> = [];
-
+export function extractRunBlocksFromAssistantText(text: string): RunBlock[] {
+  const blocks: RunBlock[] = [];
+  const ranges: Array<{ start: number; end: number; block: RunBlock }> = [];
   const thinkRe = /<think[^>]*>([\s\S]*?)<\/think>/gi;
-  let thinkMatch: RegExpExecArray | null;
-  const thinkParts: string[] = [];
-  while ((thinkMatch = thinkRe.exec(text)) !== null) {
-    const part = (thinkMatch[1] || "").trim();
-    if (part) thinkParts.push(part);
-  }
-  if (thinkParts.length) {
-    const first = thinkParts[0].split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3).join("\n");
-    if (first) items.push({ id: crypto.randomUUID(), kind: "thinking", text: first });
-  }
-
-  // Steps like: "1. List workspace files:" -> thinking card.
-  const stepRe = /^\s*(\d+)\.\s*([^:\n]+):/gm;
-  const steps: string[] = [];
-  for (const match of text.matchAll(stepRe)) {
-    const num = match[1];
-    const desc = (match[2] || "").trim();
-    if (!desc) continue;
-    steps.push(`Step ${num}: ${desc}`);
-    if (steps.length >= 5) break;
-  }
-  for (const step of steps) {
-    items.push({ id: crypto.randomUUID(), kind: "thinking", text: step });
-  }
-
-  // Code fences with shell-like commands -> tool call cards.
   const fenceRe = /```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g;
   const cmdLineRe =
-    /^\s*(?:\$|>)?\s*(ls|pwd|cd|cat|sed|awk|grep|find|rm|cp|mv|mkdir|chmod|chown|git|npm|pnpm|yarn|python|pytest|make|curl|wget|docker|docker-compose|kubectl)\b/;
+    /^\s*(?:\$|>)?\s*(ls|pwd|cd|cat|sed|awk|grep|find|rm|cp|mv|mkdir|chmod|chown|git|npm|pnpm|yarn|python|pytest|make|curl|wget|docker|docker-compose|kubectl)\b/m;
 
-  for (const match of text.matchAll(fenceRe)) {
-    const rawCode = (match[1] || "").trimEnd();
-    if (!rawCode) continue;
-    const lines = rawCode.split("\n");
-    const commandish = lines.some((l) => cmdLineRe.test(l));
-    if (!commandish) continue;
-    items.push({ id: crypto.randomUUID(), kind: "tool", text: rawCode });
+  let match: RegExpExecArray | null;
+  while ((match = thinkRe.exec(text)) !== null) {
+    const thought = (match[1] || "").trim();
+    if (!thought) continue;
+    ranges.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      block: { id: crypto.randomUUID(), kind: "thinking", text: thought, eventType: "fallback_assistant" },
+    });
+  }
+  while ((match = fenceRe.exec(text)) !== null) {
+    const code = (match[1] || "").trimEnd();
+    if (!code || !cmdLineRe.test(code)) continue;
+    ranges.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      block: { id: crypto.randomUUID(), kind: "tool", text: code, eventType: "fallback_assistant" },
+    });
   }
 
-  // If we didn't detect anything, keep the UI clean.
-  return items.slice(0, 12);
+  ranges.sort((a, b) => a.start - b.start);
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start > cursor) {
+      const assistantText = text.slice(cursor, range.start).trim();
+      if (assistantText) {
+        blocks.push({ id: crypto.randomUUID(), kind: "assistant", text: assistantText, eventType: "fallback_assistant" });
+      }
+    }
+    blocks.push(range.block);
+    cursor = range.end;
+  }
+  const tail = text.slice(cursor).trim();
+  if (tail) {
+    blocks.push({ id: crypto.randomUUID(), kind: "assistant", text: tail, eventType: "fallback_assistant" });
+  }
+  return blocks.length ? blocks : [{ id: crypto.randomUUID(), kind: "assistant", text, eventType: "fallback_assistant" }];
 }
 
 function formatModelLabel(model: string | undefined): string {
@@ -2141,12 +2386,4 @@ function deriveAgentTitle(prompt: string): string {
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
     .join(" ");
   return base.length > 34 ? `${base.slice(0, 34).trim()}...` : base;
-}
-
-function preserveSingleLineBreaks(raw: string): string {
-  return raw
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => (line.trim().length ? `${line}  ` : ""))
-    .join("\n");
 }

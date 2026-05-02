@@ -7,6 +7,7 @@ import type {
   SessionMode,
   SessionRecord,
   StreamEvent,
+  WorkspaceHealth,
   WorkspaceSummary,
   WorkspaceMode,
 } from "../types/api";
@@ -14,6 +15,20 @@ import { isClerkJwtRequired, resetLegacyWorkbenchToken, resolveApiToken } from "
 import { parseSseFrames } from "./sse";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
+
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+  detail: unknown;
+
+  constructor(message: string, status: number, body: unknown, detail: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+    this.detail = detail;
+  }
+}
 
 
 async function fetchWithAutoTokenReset(path: string, init?: RequestInit): Promise<Response> {
@@ -43,7 +58,24 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || response.statusText);
+    let body: unknown = text;
+    let detail: unknown = text;
+    try {
+      body = text ? JSON.parse(text) : null;
+      if (body && typeof body === "object" && "detail" in body) {
+        detail = (body as { detail: unknown }).detail;
+      }
+    } catch {
+      body = text;
+      detail = text;
+    }
+    const message =
+      typeof detail === "string"
+        ? detail
+        : detail && typeof detail === "object" && "message" in (detail as Record<string, unknown>)
+          ? String((detail as Record<string, unknown>).message ?? response.statusText)
+          : text || response.statusText;
+    throw new ApiError(message, response.status, body, detail);
   }
   return (await response.json()) as T;
 }
@@ -60,6 +92,16 @@ export function createWorkspace(name: string) {
   return requestJson<WorkspaceSummary>("/api/workspaces", {
     method: "POST",
     body: JSON.stringify({ name }),
+  });
+}
+
+export function getWorkspaceHealth(workspaceName: string) {
+  return requestJson<WorkspaceHealth>(`/api/workspaces/${encodeURIComponent(workspaceName)}/health`);
+}
+
+export function repairWorkspace(workspaceName: string) {
+  return requestJson<WorkspaceHealth>(`/api/workspaces/${encodeURIComponent(workspaceName)}/repair`, {
+    method: "POST",
   });
 }
 

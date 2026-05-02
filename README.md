@@ -4,6 +4,17 @@ Local Deep Coding Agent Workbench is a localhost-only coding agent UI with a Fas
 
 The current workbench is tuned for a Guild-building workflow where the main Deep Agent acts as the orchestrator and delegates specialist work in visible phases instead of one-shotting scaffold, edit, test, and publish in a single blur.
 
+## Safety and Scope Rules
+
+- Workspace-only execution: agents must keep all project artifacts under the active managed workspace (`workspaces/...`).
+- No host-temp scaffolding: agents should not create project structures under `/tmp`, `/var`, or other host-absolute roots.
+- Relative-path default: file operations and shell commands should target relative workspace paths unless explicitly justified.
+- Specialist boundaries:
+  - `cli_specialist`, `tester`, `publisher`, `session_specialist`: allowed to run shell commands when required.
+  - `validator`: read-only analysis.
+  - `decomposer` and `template_selector`: reasoning-first, minimal mutation.
+- Ambiguous/fake query handling: if a request is contradictory or unclear, the agent should ask for confirmation before irreversible work.
+
 ## Quick Start
 
 ```bash

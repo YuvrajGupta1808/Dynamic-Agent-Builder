@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { ChevronRight, FileCode2, Folder, FolderOpen } from "lucide-react";
 
 import type { FileTreeNode } from "../types/api";
@@ -9,7 +10,7 @@ interface FileTreeProps {
   onSelect: (path: string) => void;
 }
 
-export function FileTree({ node, selectedPath, onSelect }: FileTreeProps) {
+export const FileTree = memo(function FileTree({ node, selectedPath, onSelect }: FileTreeProps) {
   if (!node) return <div className="empty-state">No workspace loaded</div>;
   return (
     <div className="file-tree">
@@ -18,7 +19,7 @@ export function FileTree({ node, selectedPath, onSelect }: FileTreeProps) {
       ))}
     </div>
   );
-}
+});
 
 function TreeNode({
   node,
@@ -62,4 +63,3 @@ function TreeNode({
     </div>
   );
 }
-

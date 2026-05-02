@@ -26,3 +26,25 @@ def create_workspace(
 ) -> dict:
     root = workspace_manager.ensure_workspace(auth.user_id, payload.name)
     return {"name": root.name, "path": str(root), "created": True}
+
+
+@router.get("/workspaces/{workspace_name}/health")
+def workspace_health(
+    workspace_name: str,
+    workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
+    auth: AuthContext = Depends(get_auth_context),
+) -> dict:
+    root = workspace_manager.workspace_path(auth.user_id, workspace_name)
+    health = workspace_manager.workspace_health(root)
+    return health.model_dump(mode="json", by_alias=True)
+
+
+@router.post("/workspaces/{workspace_name}/repair")
+def repair_workspace(
+    workspace_name: str,
+    workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
+    auth: AuthContext = Depends(get_auth_context),
+) -> dict:
+    root = workspace_manager.workspace_path(auth.user_id, workspace_name)
+    health = workspace_manager.repair_workspace(root)
+    return health.model_dump(mode="json", by_alias=True)

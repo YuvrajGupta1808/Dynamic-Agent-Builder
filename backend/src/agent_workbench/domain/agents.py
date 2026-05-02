@@ -9,6 +9,8 @@ from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, Field
 
+from ..core.config import get_settings
+from ..infra.command_policy import command_policy_metadata
 from ..infra.security import redact_env
 from .fireworks_openai import FireworksReasoningChatOpenAI
 from .models import SessionMode, WorkspaceMode
@@ -45,28 +47,31 @@ Prefer small, reviewable edits and explain tradeoffs when a task has safety or d
 If the `quick_search` tool is available, use it for fast real-time web lookups when requests depend on current external information.
 
 Guild-builder orientation:
-- Treat the current workspace as a local project used to build Guild agents and install them into a Guild workspace.
-- Guild workspace/session/trigger behavior is the runtime control plane; do not invent a separate orchestrator agent unless the user explicitly asks for one.
-- Built-in Guild authoring skills are available virtually under `/skills/` even if the workspace has no on-disk `skills/` folder yet.
-- Create `AGENTS.md`, top-level planning docs, per-agent folders, and project-local `skills/` only when the user request actually calls for them.
-- The main agent is an orchestrator. Keep its knowledge focused on routing, sequencing, and quality gates. Let specialist subagents own Guild docs, CLI, SDK, integration, testing, publishing, and editing details.
-- Do not choose a Guild agent template by habit. Delegate that decision to `template_selector`, then use the result.
-- Do not personally perform Guild docs lookup, CLI discovery, SDK authoring, or publish/debug work when a specialist exists for that domain. Delegate first.
+- Treat the current workspace as a Guild builder workspace with a strict default contract.
+- Default top-level contract: `README.md` and `agents/` are required.
+- Canonical agent root: `agents/<agent-name>/...`. All generated agent code must live there.
+- Guild CLI is the primary control surface for workspace and agent lifecycle work. Manual file creation is limited to code edits inside initialized agent folders unless the user explicitly requests a different artifact.
+- Extra top-level docs, reports, planning files, or workspace-local `skills/` are opt-in only. Do not create them by default.
+- The main agent is an orchestrator. Keep its knowledge focused on routing, sequencing, and quality gates. Let specialist subagents own Guild docs, CLI, SDK, validation, publishing, and documentation details.
+- Understand the request, decompose to the minimum viable agent set, choose templates deliberately, run Guild CLI from the correct folder, validate before publish/install, and ask for confirmation when the request is fake, contradictory, or would create unnecessary artifacts.
 
-Sequential orchestration contract:
+Request triage contract:
+- Start by classifying the request before choosing a workflow.
+- If the prompt is simple, self-contained, and answerable directly from the main agent's existing Guild knowledge, answer it directly without decomposition or phased execution.
+- If the prompt is Guild-related but needs exact command behavior, version-sensitive details, workspace lifecycle sequencing, or troubleshooting, route to `cli_specialist` or another narrow specialist instead of forcing a full build workflow. This handoff is mandatory. Do not guess Guild commands from the main agent.
+- Use `decomposer` only when the request actually requires designing or changing a multi-agent Guild system, splitting responsibilities, or deciding whether more than one agent is needed.
+- Enter the sequential build workflow only when the request requires real workspace changes, agent generation, validation, publish/install work, or another multi-step implementation flow.
+
+Sequential build workflow:
 - Operate in visible phases rather than one-shotting design, code, test, and publish in one blur.
-- Phase 1: decompose the Guild system and choose templates with written justification before scaffolding.
-- Phase 2: prepare shared/per-agent context and the minimum workspace docs needed to keep the build legible.
-- Phase 3: scaffold only the required artifacts, then adapt the generated files to the actual use case.
-- Phase 4: run focused local validation before any publish or workspace install step.
-- Phase 5: enter the tester -> validator -> editor/sdk repair loop until local validation is good enough or a real blocker appears.
-- Phase 6: publish/install only after local validation is acceptable, then run representative live Guild workspace validation and summarize the exact input/output behavior.
-- Documentation is part of the workflow. Keep the repo README and workspace README aligned with the current orchestrator flow when the architecture or operator experience changes. Record validation and post-publish observations in project docs when the task is substantial.
-- You must pause for human checkpoint review before crossing major workflow boundaries. Use `request_checkpoint_review` for:
-  - `architecture_review` after decomposition/template choice
-  - `pre_publish_review` after local validation and before any publish/install step
-  - `post_publish_review` after publish/install and workspace-level validation
-- If a checkpoint review is rejected, do not continue to later phases. Summarize what was rejected and wait for new guidance.
+- Phase 1: understand the request, decide whether decomposition is needed, and choose templates with written justification before scaffolding.
+- Phase 2: create or select the remote Guild workspace, then create the local `agents/<agent-name>/` directory before any agent init.
+- Phase 3: initialize only the required local agent repos under `agents/<agent-name>/...` through Guild CLI.
+- Phase 4: edit only the generated agent code under `agents/<agent-name>/...`.
+- Phase 5: run focused local validation before any publish or workspace install step.
+- Phase 6: enter the tester -> validator -> editor/sdk repair loop until local validation is good enough or a real blocker appears.
+- Phase 7: publish/install only after local validation is acceptable, then run representative live Guild workspace validation and summarize the exact input/output behavior.
+- Keep both `<workspace>/README.md` and `<workspace>/agents/README.md` current. Repository root/global `README.md` edits are forbidden unless the user explicitly asks for them in the current run.
 
 Filesystem layout (virtual paths):
 - The default route is the workspace. Write workspace files using bare relative paths like `fibonacci_cli.py` or `src/util.py`. Absolute virtual paths like `/fibonacci_cli.py` resolve under the workspace root.
@@ -77,25 +82,58 @@ Filesystem layout (virtual paths):
   - `/conversation_history/` ephemeral run state
 - Never use host-absolute paths (for example `/Users/...`, `/etc/...`, `/tmp/...`) for `read_file`, `write_file`, or `edit_file`. They will be rejected.
 - Shell commands (`execute`) run with `cwd` already set to the workspace; reference workspace files using relative paths and avoid absolute host paths unless strictly required.
+- Distinguish three separate scopes at all times:
+  - local builder workspace root: `/`
+  - local agent repo: `/agents/<agent-name>/`
+  - remote Guild workspace: selected via Guild CLI and tracked separately from local files
+- Never create or use ad-hoc temp project roots (for example `/tmp/...`, `/var/...`) for workspace scaffolding. All project artifacts must stay under the active workspace root.
+- Reject manual scaffolding outside `agents/<agent-name>/...` unless the user explicitly requests it.
+- Never run `guild agent init` at `/`. Run it only inside `/agents/<agent-name>/` or with `--directory agents/<agent-name>`.
+- If a command proposal includes host-level paths or non-workspace targets, stop and rewrite it before execution.
 
 Subagent policy:
 - Use subagents for context quarantine when a task would otherwise require many file reads, long docs, or multi-step planning.
-- For non-trivial Guild builder tasks, delegate first. Do not begin with many direct `read_file`, `write_file`, `edit_file`, `ls`, or `execute` calls from the main agent when a specialist can do the work.
+- Do not delegate by reflex. First decide whether the request can be answered directly, needs one narrow specialist, or needs a multi-step build flow.
+- For non-trivial Guild builder tasks, delegate early. Do not begin with many direct `read_file`, `write_file`, `edit_file`, `ls`, or `execute` calls from the main agent when a specialist can do the work.
 - Keep subagent outputs concise and action-oriented. Prefer summaries, concrete edits, and next commands over raw dumps.
 - Prefer the dedicated editor subagent when adapting generated Guild files to a specific use case.
+- `decomposer` exists to answer one question: does this request need multiple agents or materially different role boundaries? Do not invoke it for simple Guild Q&A, single-agent edits, or direct CLI guidance that another specialist can answer.
 - Route between specialists deliberately. For example: context questions -> `context_specialist`, SDK/code-shape questions -> `sdk_specialist`, CLI command flow -> `cli_specialist`, workspace lifecycle -> `workspace_initializer`, and live validation -> `session_specialist`.
+- If a Guild command is uncertain, stop and hand off to `cli_specialist` before executing anything. The main orchestrator must not execute Guild CLI directly.
 - If one specialist is blocked by another domain, have it return a crisp handoff recommendation so the parent can delegate to the next specialist.
 - When independent specialist work can happen in parallel, launch multiple subagents in the same turn instead of serializing everything through one worker.
-- Use `documentation_specialist` to keep `README.md`, workspace docs, and validation reports current instead of leaving them as an afterthought.
+- Use `documentation_specialist` for workspace and `agents/` README maintenance.
 - When a specialist returns structured output, treat that structured payload as the primary result. Do not rummage through `/large_tool_results`, rerun `ls`, or probe for hidden artifacts unless the specific field you need is genuinely missing.
 - If async task tools are present, reserve them for long-running validation, publishing, or live evaluation work and never poll immediately after launch.
 - If the user says "Use only subagent <name>" or equivalent, the next action should be a single `task` call to that subagent. Do not substitute a different specialist unless you first explain why.
+- Specialist boundaries are strict:
+  - Guild CLI execution is allowlisted per specialist and blocked commands must be surfaced clearly.
+  - `decomposer` and `template_selector`: no CLI, no writes.
+  - `workspace_initializer`: workspace CLI only.
+  - `agent_initializer`: Guild agent init/test/save plus scoped edits under `agents/<name>/...`.
+  - `cli_specialist`: Guild CLI syntax and troubleshooting only.
+  - `sdk_specialist`: code edits only.
+  - `tester`: validation only.
+  - `session_specialist`: live Guild session/chat validation only.
+  - `publisher`: publish/install only after validation.
+  - `documentation_specialist`: workspace `README.md` and `agents/README.md` only.
+  - `context_specialist`: dormant unless explicitly needed.
+  - `validator` is read-only and must not modify files or run shell commands.
+  - `template_selector` and `decomposer` should be reasoning-first and avoid workspace mutation.
 
 Realtime data policy:
 - If a user asks for "current", "latest", "today", "right now", live prices, market moves, breaking news, or time-sensitive facts, call `quick_search` before answering.
 - Do not use `quick_search` for product documentation or local CLI reference when direct official docs URLs or local files are available.
 - Do not claim you lack real-time access when `quick_search` is available.
 - Summarize results with source-aware caveats when data may be delayed."""
+
+SYSTEM_PROMPT += """
+
+Query handling policy:
+- This assistant is both a Guild builder and a general coding assistant.
+- For non-Guild coding tasks, still follow minimal, reviewable, test-first behavior.
+- If a user request is ambiguous, contradictory, or likely fake/synthetic, ask a short confirmation question before making irreversible changes.
+- Do not fabricate implementation details; prefer explicit assumptions and confirmation."""
 
 
 class SpecialistReport(BaseModel):
@@ -176,12 +214,14 @@ def _main_skill_sources(cwd: Path) -> list[str]:
 
 
 def _skill_sources(cwd: Path, skill_names: list[str]) -> list[str]:
+    settings = get_settings()
     sources: list[str] = []
     for skill_name in skill_names:
         sources.append(f"/skills/builtin/{skill_name}/")
-    for skill_name in skill_names:
-        if (cwd / "skills" / skill_name).is_dir():
-            sources.append(f"/skills/project/{skill_name}/")
+    if settings.allow_workspace_local_skills:
+        for skill_name in skill_names:
+            if (cwd / "skills" / skill_name).is_dir():
+                sources.append(f"/skills/project/{skill_name}/")
     return sources
 
 
@@ -253,11 +293,22 @@ def _subagent_memory_path(name: str) -> str:
 
 def _subagent_prompt(name: str, body: str, memory_content: str) -> str:
     embedded_memory = memory_content.strip()
+    policy = command_policy_metadata(name)
+    allowed_commands = ", ".join(policy["allowed_commands"]) if policy["allowed_commands"] else "none"
     return (
         "Use the embedded role memory below as your stable operating guidance for this task. "
         "Do not waste time rediscovering it or searching the filesystem for another copy. "
         "You normally do not need to call `read_file` for role memory at all unless the parent explicitly asks you to revise persisted memory.\n\n"
         f"<role_memory>\n{embedded_memory}\n</role_memory>\n\n"
+        "Execution constraints:\n"
+        "- Work only inside the active workspace.\n"
+        "- Never create artifacts in /tmp, /var, /Users, or other host-absolute roots.\n"
+        "- Use relative workspace paths by default.\n"
+        "- Default workspace contract: root `README.md` and top-level `agents/` are required.\n"
+        "- Track these identifiers explicitly: local builder workspace `/`, local agent repo `/agents/<agent-name>/`, selected remote Guild workspace (if any).\n"
+        "- Manual file creation outside `agents/<agent-name>/...` is forbidden unless the parent explicitly says otherwise.\n"
+        f"- Guild CLI policy for `{name}`: {policy['notes']} Allowed commands: {allowed_commands}.\n"
+        "- If uncertain about command safety or path scope, return a handoff/request instead of guessing.\n\n"
         "Return concise outputs that help the parent agent act. "
         + body
     )
@@ -301,7 +352,7 @@ def _build_subagents(cwd: Path, subagent_memories: dict[str, str] | None = None)
             "tools": [],
             "system_prompt": _subagent_prompt(
                 "agent_initializer",
-                "Handle per-agent setup only: ensure the correct folder exists, the chosen template is justified, and Guild agent initialization runs from the right location. Return exact created artifacts and the next edits needed. If the task is explicitly planning-only, do not scan or modify the workspace; return the command and folder plan directly. If blocked by exact CLI behavior, hand off to `cli_specialist`. If blocked by template/code-shape concerns, hand off to `sdk_specialist` or `template_selector`.",
+                "Handle per-agent setup only: initialize the target agent under `agents/<name>/`, run Guild init/test/save commands from that agent directory or a validated `--directory agents/<name>` target, and limit manual edits to that initialized agent folder. Never run root-level init and never improvise recovery commands beyond your narrow surface. Return exact created artifacts and the next edits needed. If blocked by exact CLI behavior, hand off to `cli_specialist`. If blocked by template/code-shape concerns, hand off to `sdk_specialist` or `template_selector`.",
                 memories.get("agent_initializer", ""),
             ),
             "skills": _skill_sources(cwd, ["guild-official-docs", "guild-cli-runbook", "guild-template-selection"]),
@@ -313,7 +364,7 @@ def _build_subagents(cwd: Path, subagent_memories: dict[str, str] | None = None)
             "tools": [],
             "system_prompt": _subagent_prompt(
                 "workspace_initializer",
-                "Handle workspace-level setup only: workspace create/select, shared workspace preparation, and the minimum bootstrap needed before installation or validation. If the task is planning-only, return the bootstrap sequence directly without scanning or modifying the workspace. If command details are uncertain, hand off to `cli_specialist`. If the task becomes about installed-agent behavior, hand off to `session_specialist`.",
+                "Handle remote Guild workspace setup only: use Guild workspace commands for workspace create/select/current/get, membership operations, and shared context preparation. Keep the local builder workspace separate from the remote Guild workspace identity, and verify the selected remote workspace explicitly when state matters. Avoid probing local agent repos unless the parent explicitly asks for a local contract check. If the task is planning-only, return the bootstrap sequence directly without scanning or modifying the workspace. If command details are uncertain, hand off to `cli_specialist`. If the task becomes about installed-agent behavior, hand off to `session_specialist`.",
                 memories.get("workspace_initializer", ""),
             ),
             "skills": _workspace_skill_sources(cwd),
@@ -321,11 +372,11 @@ def _build_subagents(cwd: Path, subagent_memories: dict[str, str] | None = None)
         },
         {
             "name": "context_specialist",
-            "description": "Writes shared context, per-agent context, and memory-placement decisions.",
+            "description": "Handles explicit context/memory requests when they cannot stay implicit in the orchestrator flow.",
             "tools": [],
             "system_prompt": _subagent_prompt(
                 "context_specialist",
-                "Keep always-relevant memory small, move reusable heavy workflows into skills, and write only high-signal shared versus role-specific context. If the question becomes about code shape or template semantics, hand off to `sdk_specialist`. If it becomes about workspace publication rules, hand off to `workspace_initializer` or `publisher`.",
+                "Stay dormant unless the parent explicitly asks for context placement work. Prefer no additional artifacts under the default workspace contract. If the question becomes about code shape or template semantics, hand off to `sdk_specialist`. If it becomes about workspace publication rules, hand off to `workspace_initializer` or `publisher`.",
                 memories.get("context_specialist", ""),
             ),
             "skills": _skill_sources(cwd, ["guild-official-docs", "guild-context-writer", "guild-workspace-context"]),
@@ -337,7 +388,7 @@ def _build_subagents(cwd: Path, subagent_memories: dict[str, str] | None = None)
             "tools": [],
             "system_prompt": _subagent_prompt(
                 "cli_specialist",
-                "Focus on exact Guild CLI behavior, flags, ordering, and troubleshooting. Reuse known-good command flows and only refresh docs when command behavior is uncertain or uncommon.",
+                "Focus on exact Guild CLI behavior, flags, ordering, troubleshooting, workspace/session inspection, and publish/version flows. Reuse known-good command flows and only refresh docs when command behavior is uncertain or uncommon. Own the canonical command flows for remote workspace create/select/current/get, workspace context commands, per-agent init inside `agents/<name>/`, live workspace chat/session inspection, publish/version commands, and recovery decisions between clone/pull/init when remote state and local scaffolding diverge.",
                 memories.get("cli_specialist", ""),
             ),
             "skills": _cli_skill_sources(cwd),
@@ -385,7 +436,7 @@ def _build_subagents(cwd: Path, subagent_memories: dict[str, str] | None = None)
             "tools": [],
             "system_prompt": _subagent_prompt(
                 "session_specialist",
-                "Focus on live chat and session validation. Propose representative prompts, inspect session behavior, and summarize whether the installed agents behave as intended.",
+                "Focus on live chat and session validation. Prefer workspace-scoped validation when behavior depends on installed agents or shared workspace context. You may use read-only workspace inspection commands (`guild workspace current/get`, `guild workspace agent list`) to confirm the target workspace and installed agents before validating. For non-interactive checks, resolve the workspace identifier first and use `guild chat --workspace <id-or-full-name> --once ...`. Inspect session behavior through session detail/event/task commands, and summarize whether the installed agents behave as intended.",
                 memories.get("session_specialist", ""),
             ),
             "skills": _skill_sources(cwd, ["guild-official-docs", "guild-workspace-publisher"]),
@@ -393,11 +444,11 @@ def _build_subagents(cwd: Path, subagent_memories: dict[str, str] | None = None)
         },
         {
             "name": "documentation_specialist",
-            "description": "Updates README files, validation notes, and deployment reports so the build trail stays reviewable.",
+            "description": "Updates the workspace README only when it is explicitly needed.",
             "tools": [],
             "system_prompt": _subagent_prompt(
                 "documentation_specialist",
-                "Keep operator-facing docs accurate. Update the repo README, workspace README, and validation/deployment notes when the architecture, workflow, commands, or outcomes change materially. Prefer concise, high-signal documentation over verbose changelogs. If the task asks for a documentation plan only, answer directly from the described workflow instead of scanning files first.",
+                "Keep the workspace README accurate when the parent explicitly requests it or when the user asked for operator-facing documentation. Do not create validation reports, deployment reports, or repo/global README edits by default. If the task asks for a documentation plan only, answer directly from the described workflow instead of scanning files first.",
                 memories.get("documentation_specialist", ""),
             ),
             "skills": _skill_sources(cwd, ["guild-official-docs", "guild-context-writer", "guild-publish-and-versions"]),
@@ -445,7 +496,7 @@ def _build_subagents(cwd: Path, subagent_memories: dict[str, str] | None = None)
             "tools": [],
             "system_prompt": _subagent_prompt(
                 "publisher",
-                "Focus on Guild workspace selection, agent installation, shared context publication, and representative live chat validation.",
+                "Focus on Guild publish/version commands, workspace selection and inspection, agent installation/removal, shared context publication, and representative live workspace validation after publish/install.",
                 memories.get("publisher", ""),
             ),
             "skills": _scoped_skill_sources(cwd, "guild-workspace-publisher"),
@@ -481,14 +532,12 @@ def _build_async_subagents() -> list[dict[str, Any]]:
 
 
 def _memory_sources(cwd: Path) -> list[str]:
-    sources = [
+    _ = cwd
+    return [
         "/memories/workspace/GUILD_BUILDER.md",
         "/memories/session/WORKBENCH.md",
         "/policies/compliance.md",
     ]
-    if (cwd / "AGENTS.md").exists():
-        sources.insert(0, "/AGENTS.md")
-    return sources
 
 
 def _quick_search_tool() -> Any | None:
@@ -541,6 +590,11 @@ class AgentSessionContext:
     mode: SessionMode
     model: str
     command_timeout_seconds: int
+
+    @property
+    def runtime_artifacts_root(self) -> Path:
+        settings = get_settings()
+        return settings.data_dir / "runtime_artifacts" / self.session_id
 
 
 class MockCodingAgent:
@@ -689,6 +743,14 @@ def build_agent(
         inherit_env=True,
         env=redact_env(os.environ.copy()),
     )
+    large_tool_results_root = context.runtime_artifacts_root / "large_tool_results"
+    large_tool_results_root.mkdir(parents=True, exist_ok=True)
+    large_tool_results_backend = LocalShellBackend(
+        root_dir=str(large_tool_results_root),
+        virtual_mode=True,
+        inherit_env=True,
+        env=redact_env(os.environ.copy()),
+    )
     ephemeral_backend = StateBackend()
     session_ns = context.session_id
 
@@ -721,6 +783,7 @@ def build_agent(
                 store=resolved_store,
                 namespace=lambda _rt: ("workbench",),
             ),
+            "/large_tool_results/": large_tool_results_backend,
             "/conversation_history/": ephemeral_backend,
         },
     )

@@ -6,13 +6,14 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile, status
 
 from ..core.config import Settings
-from ..domain.models import DiffResponse, FileContentResponse, FileTreeNode, WorkspaceMode
+from ..domain.models import DiffResponse, FileContentResponse, FileTreeNode, WorkspaceHealth, WorkspaceMode
 from .security import ensure_allowed_root, resolve_workspace_path
 
 IGNORED_DIRS = {".git", "node_modules", "dist", "coverage", ".data", ".venv", "venv", "__pycache__"}
@@ -35,6 +36,9 @@ TEXT_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
+ALLOWED_TOP_LEVEL_FILES = {"README.md"}
+RECOVERABLE_TOP_LEVEL_FILES = {"guild.json"}
+RECOVERABLE_TOP_LEVEL_DIRS = {"large_tool_results"}
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,8 @@ class WorkspaceManager:
         session_id = uuid4().hex
         root = self.root_for(mode, session_id, cwd, workspace_name, user_id=user_id)
         root.mkdir(parents=True, exist_ok=True)
+        if mode == "local":
+            self.ensure_contract(root)
         return Workspace(
             session_id=session_id,
             mode=mode,
@@ -124,26 +130,174 @@ class WorkspaceManager:
     def ensure_workspace(self, user_id: str, name: str) -> Path:
         root = self.workspace_path(user_id, name)
         root.mkdir(parents=True, exist_ok=True)
-        readme = root / "README.md"
-        if not readme.exists():
-            readme.write_text(
+        self.ensure_contract(root)
+        return root
+
+    @property
+    def canonical_agents_root(self) -> str:
+        return self.settings.workspace_agents_root
+
+    def agents_root(self, root: Path) -> Path:
+        return root / self.settings.workspace_agents_root
+
+    def ensure_contract(self, root: Path) -> None:
+        agents_root = self.agents_root(root)
+        agents_root.mkdir(parents=True, exist_ok=True)
+        if self.settings.workspace_seed_readme:
+            self._ensure_workspace_readmes(root, agents_root)
+        self.validate_workspace_layout(root)
+
+    def _ensure_workspace_readmes(self, root: Path, agents_root: Path) -> None:
+        workspace_readme = root / "README.md"
+        if not workspace_readme.exists():
+            workspace_readme.write_text(
                 (
                     f"# {root.name}\n\n"
-                    "This managed workspace starts minimal. The Deep Agent should create project files, docs, skills, and Guild agent folders only when the user request calls for them.\n\n"
-                    "Expected build flow:\n"
-                    "1. Decompose the requested Guild system and choose templates with written justification.\n"
-                    "2. Stop for an architecture checkpoint review before moving deeper into implementation.\n"
-                    "3. Set up only the files and folders that are actually needed.\n"
-                    "4. Adapt generated scaffolds to the real use case.\n"
-                    "5. Run local validation before any publish or workspace install step.\n"
-                    "6. Stop for a pre-publish checkpoint review before any publish or workspace install step.\n"
-                    "7. Record validation and post-publish observations in workspace docs when the task is substantial.\n"
+                    "Guild builder workspace.\n\n"
+                    "Workspace contract:\n"
+                    f"- Root-level agent code lives under `{self.settings.workspace_agents_root}/<agent-name>/...`\n"
+                    "- Keep this README updated with the operator-facing build and validation flow.\n"
+                    "- Extra top-level artifacts are opt-in only.\n"
                 ),
                 encoding="utf-8",
             )
-        return root
+
+        agents_readme = agents_root / "README.md"
+        if not agents_readme.exists():
+            agents_readme.write_text(
+                (
+                    "# Agents\n\n"
+                    "This directory contains Guild agents.\n\n"
+                    "Rules:\n"
+                    "- Each agent must live in its own subdirectory.\n"
+                    "- Generated agent code and prompts stay within that agent directory.\n"
+                    "- Keep this README updated when the agents layout or conventions change.\n"
+                ),
+                encoding="utf-8",
+            )
+
+    def validate_workspace_layout(self, root: Path) -> None:
+        if not self._uses_local_workspace_contract(root):
+            return
+        health = self.workspace_health(root)
+        if health.status == "invalid":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=health.model_dump(mode="json", by_alias=True))
+
+    def _uses_local_workspace_contract(self, root: Path) -> bool:
+        try:
+            root.resolve().relative_to(self.settings.workspace_root.resolve())
+        except ValueError:
+            return False
+        return True
+
+    def workspace_health(self, root: Path) -> WorkspaceHealth:
+        allowed_entries = [f"{self.settings.workspace_agents_root}/", "*.md"]
+        if not root.exists():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+        if not self._uses_local_workspace_contract(root):
+            return WorkspaceHealth(
+                name=root.name,
+                path=str(root.resolve()),
+                status="valid",
+                allowedTopLevelEntries=allowed_entries,
+                message="Workspace is outside the managed local workspace root.",
+            )
+
+        invalid_entries: list[str] = []
+        recoverable_entries: list[str] = []
+        blocking_entries: list[str] = []
+        allowed_dirs = {self.settings.workspace_agents_root}
+        for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+            if child.name.startswith("."):
+                continue
+            if child.is_dir():
+                if child.name in allowed_dirs:
+                    continue
+                entry = child.name + "/"
+                invalid_entries.append(entry)
+                if child.name in RECOVERABLE_TOP_LEVEL_DIRS:
+                    recoverable_entries.append(entry)
+                else:
+                    blocking_entries.append(entry)
+                continue
+            if self._is_allowed_top_level_file(child):
+                continue
+            entry = child.name
+            invalid_entries.append(entry)
+            if child.name in RECOVERABLE_TOP_LEVEL_FILES:
+                recoverable_entries.append(entry)
+            else:
+                blocking_entries.append(entry)
+
+        if not invalid_entries:
+            return WorkspaceHealth(
+                name=root.name,
+                path=str(root.resolve()),
+                status="valid",
+                allowedTopLevelEntries=allowed_entries,
+                message="Workspace contract is valid.",
+            )
+
+        recoverable = len(blocking_entries) == 0
+        return WorkspaceHealth(
+            name=root.name,
+            path=str(root.resolve()),
+            status="invalid",
+            recoverable=recoverable,
+            repairAvailable=recoverable,
+            invalidEntries=invalid_entries,
+            recoverableEntries=recoverable_entries,
+            blockingEntries=blocking_entries,
+            allowedTopLevelEntries=allowed_entries,
+            message=(
+                "Workspace layout violation. Allowed top-level entries: "
+                f"{', '.join(allowed_entries)}. "
+                f"Disallowed entries: {', '.join(invalid_entries)}"
+            ),
+        )
+
+    def _is_allowed_top_level_file(self, path: Path) -> bool:
+        return path.name in ALLOWED_TOP_LEVEL_FILES or path.suffix.lower() == ".md"
+
+    def repair_workspace(self, root: Path) -> WorkspaceHealth:
+        health = self.workspace_health(root)
+        if health.status == "valid":
+            return health
+        if not health.recoverable:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=health.model_dump(mode="json", by_alias=True),
+            )
+
+        repaired_entries: list[str] = []
+        quarantine_root = self._repair_target_root(root)
+        quarantine_root.mkdir(parents=True, exist_ok=True)
+        for entry in health.recoverable_entries:
+            source = root / entry.removesuffix("/")
+            if not source.exists():
+                continue
+            target = quarantine_root / source.name
+            if target.exists():
+                timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+                target = quarantine_root / f"{source.name}.{timestamp}"
+            source.rename(target)
+            repaired_entries.append(entry)
+
+        self.ensure_contract(root)
+        updated = self.workspace_health(root)
+        return updated.model_copy(
+            update={
+                "repaired_entries": repaired_entries,
+                "repair_available": updated.repair_available,
+                "message": "Workspace repaired successfully." if updated.status == "valid" else updated.message,
+            }
+        )
+
+    def _repair_target_root(self, root: Path) -> Path:
+        return self.settings.data_dir / "workspace_repairs" / sanitize_workspace_name(root.name)
 
     def tree(self, root: Path) -> FileTreeNode:
+        self.validate_workspace_layout(root)
         entries_seen = 0
 
         def walk(path: Path, depth: int) -> FileTreeNode:
@@ -179,6 +333,7 @@ class WorkspaceManager:
         return walk(root, 5)
 
     def read_file(self, root: Path, path: str) -> FileContentResponse:
+        self.validate_workspace_layout(root)
         resolved = resolve_workspace_path(root, path, must_exist=True)
         if not resolved.is_file():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path is not a file")
@@ -194,21 +349,49 @@ class WorkspaceManager:
         return FileContentResponse(path=path, content=content, truncated=truncated)
 
     def write_file(self, root: Path, path: str, content: str) -> FileContentResponse:
+        self.validate_workspace_layout(root)
         resolved = resolve_workspace_path(root, path)
+        relative = resolved.relative_to(root).as_posix()
+        if not self._is_allowed_workspace_write(relative):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Writes are restricted to top-level Markdown files and files under "
+                    f"`{self.settings.workspace_agents_root}/<agent-name>/...`."
+                ),
+            )
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
         return FileContentResponse(path=path, content=content, truncated=False)
 
     async def save_uploads(self, root: Path, files: list[UploadFile]) -> list[str]:
+        self.validate_workspace_layout(root)
         saved: list[str] = []
         for file in files:
             safe_name = Path(file.filename or "upload.txt").name
             target = resolve_workspace_path(root, safe_name)
+            if self._uses_local_workspace_contract(root):
+                relative = target.relative_to(root).as_posix()
+                if not self._is_allowed_workspace_write(relative):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=(
+                            "Uploads are restricted to top-level Markdown files and files under "
+                            f"`{self.settings.workspace_agents_root}/<agent-name>/...`."
+                        ),
+                    )
             target.parent.mkdir(parents=True, exist_ok=True)
             content = await file.read()
             target.write_bytes(content)
             saved.append(safe_name)
         return saved
+
+    def _is_allowed_workspace_write(self, relative: str) -> bool:
+        if relative.startswith(f"{self.settings.workspace_agents_root}/"):
+            return True
+        if "/" in relative:
+            return False
+        return Path(relative).suffix.lower() == ".md"
 
     def diff(self, root: Path, path: str | None = None) -> DiffResponse:
         if not (root / ".git").exists():

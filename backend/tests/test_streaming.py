@@ -1,8 +1,10 @@
 from pathlib import Path
 import time
 
+from agent_workbench.core.config import get_settings
 from agent_workbench.domain.agents import _build_subagents, _main_skill_sources, _memory_sources
 from agent_workbench.domain.models import ChatMessage, RunStreamRequest, SessionRecord
+from agent_workbench.infra.command_policy import GuildExecutionContext, evaluate_execute_request, evaluate_specialist_command
 from agent_workbench.infra.deep_agent_resources import ensure_session_store_seeded, get_langgraph_store, workspace_namespace
 from agent_workbench.infra.session_store import SessionStore
 from agent_workbench.services.streaming import (
@@ -71,6 +73,27 @@ def test_normalize_subagent_custom_event_uses_subagent_name_as_source(tmp_path: 
     )
     assert events[0].type == "subagent"
     assert events[0].source == "decomposer"
+
+
+def test_normalize_blocked_command_event(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    sequencer = EventSequencer("run-1", "session-1")
+    events = normalize_chunk(
+        {
+            "type": "custom",
+            "ns": ("tools:cli_specialist",),
+            "data": {
+                "event": "blocked_command",
+                "specialist": "cli_specialist",
+                "command": "rm -rf .",
+                "reason": "cli_specialist cannot run this command under the Guild CLI policy.",
+            },
+        },
+        sequencer,
+        store,
+    )
+    assert events[0].type == "blocked_command"
+    assert events[0].source == "cli_specialist"
 
 
 def test_normalize_messages_reasoning_not_duplicated_across_messages_and_updates(tmp_path: Path) -> None:
@@ -191,6 +214,62 @@ def test_updates_interrupt_variant_emits_approval_required(tmp_path: Path) -> No
     assert approval.data["interruptId"] == "intr-1"
     assert approval.data["tool"] == "execute"
     assert approval.data["allowedDecisions"] == ["approve", "reject"]
+
+
+def test_root_guild_agent_init_interrupt_is_blocked_before_approval(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    sequencer = EventSequencer("run-1", "session-1")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    events = normalize_chunk(
+        {
+            "type": "updates",
+            "ns": (),
+            "_workbench_interrupts": [
+                {
+                    "interruptId": "intr-root-init",
+                    "tool": "execute",
+                    "payload": {"command": "guild agent init --name booking-management --template LLM"},
+                }
+            ],
+        },
+        sequencer,
+        store,
+        workspace_root=workspace_root,
+        current_specialist="agent_initializer",
+    )
+    assert [event.type for event in events] == ["blocked_command", "update"]
+    blocked = events[0]
+    assert blocked.source == "agent_initializer"
+    assert "Run `guild agent init` only inside `agents/<agent-name>/`" in (blocked.message or "")
+
+
+def test_agent_initializer_interrupt_allows_scoped_directory_init(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    sequencer = EventSequencer("run-1", "session-1")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    events = normalize_chunk(
+        {
+            "type": "updates",
+            "ns": (),
+            "_workbench_interrupts": [
+                {
+                    "interruptId": "intr-scoped-init",
+                    "tool": "execute",
+                    "payload": {
+                        "command": "guild agent init --name booking-management --template LLM --directory agents/booking-management"
+                    },
+                }
+            ],
+        },
+        sequencer,
+        store,
+        workspace_root=workspace_root,
+        current_specialist="agent_initializer",
+    )
+    assert any(event.type == "approval_required" for event in events)
+    assert all(event.type != "blocked_command" for event in events)
 
 
 def test_updates_interrupt_variant_preserves_allowed_decisions(tmp_path: Path) -> None:
@@ -364,14 +443,14 @@ def test_langgraph_store_session_seed_idempotent() -> None:
     ensure_session_store_seeded(store, sid)
     assert store.get((sid,), "/memories/session/WORKBENCH.md") is not None
     assert store.get((sid,), "/memories/WORKBENCH.md") is not None
-    assert store.get((sid,), "/skills/workbench-hint/SKILL.md") is not None
-    assert store.get((sid,), "/skills/guild-orchestrator-routing/SKILL.md") is not None
-    assert store.get((sid,), "/skills/builtin/guild-orchestrator-routing/SKILL.md") is not None
-    assert store.get((sid,), "/skills/guild-official-docs/SKILL.md") is not None
-    assert store.get((sid,), "/skills/builtin/guild-official-docs/SKILL.md") is not None
-    assert store.get((sid,), "/skills/guild-template-selection/SKILL.md") is not None
-    assert store.get((sid,), "/skills/builtin/guild-template-selection/SKILL.md") is not None
-    assert store.get((sid,), "/skills/guild-sdk-llm-agent/SKILL.md") is not None
+    assert store.get((sid,), "/workbench-hint/SKILL.md") is not None
+    assert store.get((sid,), "/guild-orchestrator-routing/SKILL.md") is not None
+    assert store.get((sid,), "/builtin/guild-orchestrator-routing/SKILL.md") is not None
+    assert store.get((sid,), "/guild-official-docs/SKILL.md") is not None
+    assert store.get((sid,), "/builtin/guild-official-docs/SKILL.md") is not None
+    assert store.get((sid,), "/guild-template-selection/SKILL.md") is not None
+    assert store.get((sid,), "/builtin/guild-template-selection/SKILL.md") is not None
+    assert store.get((sid,), "/guild-sdk-llm-agent/SKILL.md") is not None
 
 
 def test_langgraph_store_seeds_workspace_memory(tmp_path: Path) -> None:
@@ -386,10 +465,10 @@ def test_langgraph_store_seeds_workspace_memory(tmp_path: Path) -> None:
     assert "Do not use `quick_search` for Guild docs" in str(builder.value["content"])
     cli = store.get(ns, "/memories/workspace/GUILD_CLI_BASELINE.md")
     assert cli is not None
-    assert "guild agent init --name <agent-name> --template <template>" in str(cli.value["content"])
+    assert "guild agent init" in str(cli.value["content"])
     editor = store.get(ns, "/memories/workspace/IMPLEMENTATION_EDITOR.md")
     assert editor is not None
-    assert "do not leave generic README, PROMPT, CONTEXT, or WORKFLOW content" in str(editor.value["content"])
+    assert "do not manually scaffold files outside `agents/<agent-name>/...`" in str(editor.value["content"])
     docs_cache = store.get(ns, "/memories/workspace/GUILD_DOCS_CACHE.md")
     assert docs_cache is not None
     subagent_memory = store.get(ns, "/memories/subagents/editor.md")
@@ -400,13 +479,20 @@ def test_langgraph_store_seeds_workspace_memory(tmp_path: Path) -> None:
     assert "turn generated scaffolds into use-case-specific artifacts" in str(subagent_alias.value["content"])
     cli_specialist_memory = store.get(ns, "/memories/subagents/cli_specialist.md")
     assert cli_specialist_memory is not None
-    assert "Guild CLI sequencing, flags, and troubleshooting" in str(cli_specialist_memory.value["content"])
+    assert "Guild CLI sequencing, flags, troubleshooting, and recovery decisions" in str(cli_specialist_memory.value["content"])
+    assert "guild agent clone" in str(cli_specialist_memory.value["content"])
+    assert "guild workspace current" in str(cli_specialist_memory.value["content"])
+    assert "guild session list/get/events/tasks/send" in str(cli_specialist_memory.value["content"])
+    session_specialist_memory = store.get(ns, "/memories/subagents/session_specialist.md")
+    assert session_specialist_memory is not None
+    assert "guild workspace current" in str(session_specialist_memory.value["content"])
+    assert "use `--once` for non-interactive command execution" in str(session_specialist_memory.value["content"])
     tester_memory = store.get(ns, "/memories/subagents/tester.md")
     assert tester_memory is not None
     assert "Run the narrowest useful validation command" in str(tester_memory.value["content"])
     documentation_memory = store.get(ns, "/memories/subagents/documentation_specialist.md")
     assert documentation_memory is not None
-    assert "repo README" in str(documentation_memory.value["content"])
+    assert "workspace `README.md`" in str(documentation_memory.value["content"])
 
 
 def test_langgraph_store_syncs_workspace_skill_overrides(tmp_path: Path) -> None:
@@ -426,14 +512,21 @@ Project override.
 """,
         encoding="utf-8",
     )
+    get_settings.cache_clear()
+    import os
+
+    os.environ["WORKBENCH_ALLOW_WORKSPACE_LOCAL_SKILLS"] = "true"
+    get_settings.cache_clear()
     store = get_langgraph_store()
     ensure_session_store_seeded(store, sid, workspace_root)
-    skill = store.get((sid,), "/skills/guild-template-selection/SKILL.md")
+    skill = store.get((sid,), "/guild-template-selection/SKILL.md")
     assert skill is not None
     assert "Override description" in str(skill.value["content"])
-    layered = store.get((sid,), "/skills/project/guild-template-selection/SKILL.md")
+    layered = store.get((sid,), "/project/guild-template-selection/SKILL.md")
     assert layered is not None
     assert "Override description" in str(layered.value["content"])
+    os.environ["WORKBENCH_ALLOW_WORKSPACE_LOCAL_SKILLS"] = "false"
+    get_settings.cache_clear()
 
 
 def test_subagent_roster_excludes_removed_defaults(tmp_path: Path) -> None:
@@ -461,6 +554,87 @@ def test_main_agent_memory_stays_router_focused(tmp_path: Path) -> None:
     assert "/memories/workspace/GUILD_CLI_BASELINE.md" not in memories
     assert "/memories/workspace/IMPLEMENTATION_EDITOR.md" not in memories
     assert "/memories/workspace/GUILD_DOCS_CACHE.md" not in memories
+
+
+def test_specialist_command_policy_blocks_disallowed_command() -> None:
+    decision = evaluate_specialist_command("tester", "guild workspace create support-suite")
+    assert decision.allowed is False
+    assert "tester cannot run" in decision.reason
+
+
+def test_specialist_command_policy_allows_expected_guild_command() -> None:
+    decision = evaluate_specialist_command("publisher", "guild workspace agent add acme/refunds-agent")
+    assert decision.allowed is True
+    assert decision.matched_rule == "guild workspace agent add"
+
+
+def test_specialist_command_policy_allows_workspace_context_for_workspace_initializer() -> None:
+    decision = evaluate_specialist_command("workspace_initializer", "guild workspace context publish ws-123 ctx-456")
+    assert decision.allowed is True
+    assert decision.matched_rule == "guild workspace context publish"
+
+
+def test_specialist_command_policy_allows_workspace_chat_for_session_specialist() -> None:
+    decision = evaluate_specialist_command("session_specialist", "guild chat --workspace ws-123 --once status")
+    assert decision.allowed is True
+    assert decision.matched_rule == "guild chat --workspace"
+
+
+def test_specialist_command_policy_allows_workspace_agent_list_for_session_specialist() -> None:
+    decision = evaluate_specialist_command("session_specialist", "guild workspace agent list")
+    assert decision.allowed is True
+    assert decision.matched_rule == "guild workspace agent list"
+
+
+def test_specialist_command_policy_allows_workspace_current_for_session_specialist() -> None:
+    decision = evaluate_specialist_command("session_specialist", "guild workspace current")
+    assert decision.allowed is True
+    assert decision.matched_rule == "guild workspace current"
+
+
+def test_specialist_command_policy_allows_publish_wait_for_publisher() -> None:
+    decision = evaluate_specialist_command("publisher", "guild agent publish --wait")
+    assert decision.allowed is True
+    assert decision.matched_rule in {"guild agent publish", "guild agent publish --wait"}
+
+
+def test_execute_policy_blocks_root_level_agent_init_for_agent_initializer(tmp_path: Path) -> None:
+    decision = evaluate_execute_request(
+        GuildExecutionContext(
+            specialist="agent_initializer",
+            command="guild agent init --name booking-management --template LLM",
+            workspace_root=tmp_path,
+            current_cwd=tmp_path,
+        )
+    )
+    assert decision.allowed is False
+    assert "Run `guild agent init` only inside `agents/<agent-name>/`" in decision.reason
+
+
+def test_execute_policy_blocks_workspace_cli_for_agent_initializer(tmp_path: Path) -> None:
+    decision = evaluate_execute_request(
+        GuildExecutionContext(
+            specialist="agent_initializer",
+            command="guild workspace create travel-support",
+            workspace_root=tmp_path,
+            current_cwd=tmp_path,
+        )
+    )
+    assert decision.allowed is False
+    assert "agent_initializer cannot run" in decision.reason
+
+
+def test_execute_policy_blocks_non_guild_shell_for_agent_initializer(tmp_path: Path) -> None:
+    decision = evaluate_execute_request(
+        GuildExecutionContext(
+            specialist="agent_initializer",
+            command="pwd",
+            workspace_root=tmp_path,
+            current_cwd=tmp_path,
+        )
+    )
+    assert decision.allowed is False
+    assert "agent_initializer cannot run" in decision.reason
 
 
 def test_mock_stream_emits_done(tmp_path: Path) -> None:

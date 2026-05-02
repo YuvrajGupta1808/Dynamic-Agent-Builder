@@ -28,12 +28,12 @@ specialist and keep the build sequential and reviewable.
 ## Instructions
 
 1. Read `routing-map.md`.
-2. Maintain a clear phase order: design -> context/docs -> scaffold -> edit -> local validate -> repair loop -> publish/install -> live validate.
+2. Maintain a clear phase order: understand request -> decompose -> choose templates -> CLI initialize -> edit agent code -> local validate -> repair loop -> publish/install -> live validate.
 3. Delegate domain work to specialists instead of holding Guild details in the main prompt.
 4. When two specialist tasks are independent, launch them in parallel in the same turn.
 5. Stop for `request_checkpoint_review` at architecture, pre-publish, and post-publish boundaries instead of one-shotting the whole workflow.
 6. Do not let publish start before tester/validator work says local validation is good enough and the pre-publish checkpoint is approved.
-7. Use `documentation_specialist` whenever operator-facing docs or validation notes must be updated.
+7. Use `documentation_specialist` only for an explicit workspace `README.md` need.
 """,
     "skills/guild-orchestrator-routing/routing-map.md": """# Orchestrator Routing Map
 
@@ -52,7 +52,7 @@ specialist and keep the build sequential and reviewable.
 - template choice -> `template_selector`
 - per-agent scaffold init -> `agent_initializer`
 - workspace creation/selection/bootstrap -> `workspace_initializer`
-- memory/context placement -> `context_specialist`
+- explicit context placement -> `context_specialist`
 - exact Guild CLI commands or flags -> `cli_specialist`
 - Guild SDK code shape or non-LLM logic -> `sdk_specialist`
 - integrations and credentials -> `integration_specialist`
@@ -60,15 +60,14 @@ specialist and keep the build sequential and reviewable.
 - scaffold rewriting and use-case-specific edits -> `editor`
 - local validation execution -> `tester`
 - failure diagnosis and smallest-next-fix guidance -> `validator`
-- README or validation/deployment note updates -> `documentation_specialist`
+- workspace README updates -> `documentation_specialist`
 - workspace install, publish, and live validation -> `publisher`
 - representative live session evaluation -> `session_specialist`
 
 ## Parallel fan-out examples
 
 - `decomposer` then `template_selector` per role
-- `context_specialist` and `documentation_specialist` after architecture is stable
-- `tester` and `documentation_specialist` only when docs can be updated from already-known results
+- `tester` and `documentation_specialist` only when a workspace README update is already justified
 
 ## Guardrails
 
@@ -474,7 +473,7 @@ This skill helps diagnose Guild CLI failures.
     "skills/guild-agent-decomposition/SKILL.md": """---
 name: guild-agent-decomposition
 description: Use this skill when a request needs to be decomposed into multiple Guild agents with distinct roles, boundaries, and ownership. It helps prevent unnecessary agent sprawl and should escalate to official docs only if the decomposition depends on exact Guild behavior.
-allowed-tools: read_file, write_file, edit_file, execute
+allowed-tools: read_file
 metadata:
   domain: guild-builder
   version: "1.0"
@@ -494,7 +493,7 @@ what each agent should own.
 ## Instructions
 
 1. Read `decision-checklist.md`.
-2. Produce or update the top-level system spec only after inspecting the actual user request.
+2. Return the minimum viable agent set directly from the user request.
 3. Assign each agent one clear role and boundary.
 4. Avoid creating an extra orchestrator agent unless explicitly required.
 5. If the decomposition depends on exact Guild runtime behavior, use `guild-official-docs` first.
@@ -508,8 +507,8 @@ what each agent should own.
 """,
     "skills/guild-template-selection/SKILL.md": """---
 name: guild-template-selection
-description: Use this skill when deciding which Guild agent template to use. It maps requested behavior to LLM, AUTO_MANAGED_STATE, or BLANK with a written justification for AGENT_SPEC.md, and it should refresh official docs before non-LLM agent generation.
-allowed-tools: read_file, edit_file, write_file, execute
+description: Use this skill when deciding which Guild agent template to use. It maps requested behavior to LLM, AUTO_MANAGED_STATE, or BLANK with a written justification in chat, and it should refresh official docs before non-LLM agent generation.
+allowed-tools: read_file
 metadata:
   domain: guild-builder
   version: "1.0"
@@ -531,7 +530,7 @@ habit.
 1. Read `selection-matrix.md`.
 2. Identify whether the job is prompt-driven, sequential, or explicitly stateful.
 3. If the likely answer is not `LLM`, fetch official Guild docs first.
-4. Write the chosen template and reasoning into the agent's `AGENT_SPEC.md`.
+4. Return the chosen template and reasoning in the response.
 5. Record rejected alternatives briefly.
 """,
     "skills/guild-template-selection/selection-matrix.md": """# Template Selection Matrix
@@ -552,8 +551,8 @@ habit.
 """,
     "skills/guild-context-writer/SKILL.md": """---
 name: guild-context-writer
-description: Use this skill when deciding what belongs in AGENTS.md, shared workspace context, per-agent context, and per-agent prompts. It compresses noisy documentation into high-signal authored context and should refresh official docs before workspace context publishing.
-allowed-tools: read_file, write_file, edit_file, execute
+description: Use this skill only when explicit context placement work is required. It compresses noisy documentation into high-signal authored context and should refresh official docs before workspace context publishing.
+allowed-tools: read_file
 metadata:
   domain: guild-builder
   version: "1.0"
@@ -573,21 +572,18 @@ projects.
 ## Instructions
 
 1. Read `context-checklist.md`.
-2. Keep `AGENTS.md` always relevant and minimal when the user actually needs one.
-3. Put cross-agent facts in `WORKSPACE_CONTEXT.md`.
-4. Put role-specific guidance in the agent folder only.
-5. Move large reusable workflows into skills instead of memory.
-6. Fetch official docs before running workspace context publish commands.
-7. Update `README.md` and the workspace README when the operator-facing flow changes materially.
+2. Under the default contract, prefer no extra workspace artifacts.
+3. Put role-specific guidance in the agent folder only when explicitly needed.
+4. Fetch official docs before running workspace context publish commands.
+5. Update the workspace `README.md` only when the user explicitly wants operator-facing docs.
 """,
     "skills/guild-context-writer/context-checklist.md": """# Context Checklist
 
-- Memory (`AGENTS.md`) is always loaded: keep it minimal
-- Shared workspace context should include only cross-agent facts
+- Prefer no extra context files under the default contract
 - Per-agent context should describe scope, refusals, and examples
-- Large reusable workflows belong in `skills/`
+- Workspace-local `skills/` are opt-in only
 - Long outputs and logs should stay in files, not chat history
-- README files should describe the current orchestrator flow, not stale scaffold assumptions
+- Workspace `README.md` should describe the current orchestrator flow when it exists
 """,
     "skills/guild-cli-runbook/SKILL.md": """---
 name: guild-cli-runbook
@@ -614,7 +610,7 @@ workspace-level Guild operations.
 1. Read `commands.md`.
 2. Run agent-folder commands from the correct agent directory.
 3. Run workspace commands only after agents validate locally.
-4. Record command outcomes in `TEST_RESULTS.md` when that file exists or create it when the user workflow needs it.
+4. Do not create side-artifact reports by default.
 5. Fetch official docs before uncommon Guild commands or when exact CLI behavior matters.
 6. Do not run repeated `guild --help` commands for common flows already covered by workspace memory or this runbook.
 """,
@@ -622,10 +618,10 @@ workspace-level Guild operations.
 
 ## Agent folder
 - `guild auth status`
-- `guild agent init --name <agent-name> --template <template>`
+- `guild agent init`
 - `guild agent test --ephemeral`
 - `guild agent chat`
-- `guild agent save --message "<message>" --wait --publish`
+- `guild agent save`
 
 ## Workspace
 - `guild workspace list`
@@ -663,12 +659,12 @@ This skill keeps the Deep Agent in a tight diagnose-patch-rerun loop.
 4. Patch the smallest relevant file.
 5. Refresh official docs before relying on uncommon remediation paths.
 6. Rerun only the necessary command.
-7. Record high-signal validation outcomes in `TEST_RESULTS.md` when the task is substantial.
+7. Keep validation output in chat unless the user explicitly asks for a file.
 """,
     "skills/guild-repair-loop/failure-playbook.md": """# Failure Playbook
 
 1. Capture the failed command exactly
-2. Summarize the failure in `TEST_RESULTS.md`
+2. Summarize the failure in chat unless the user explicitly asked for a file
 3. Identify the smallest relevant file to change
 4. Patch that file
 5. Rerun the narrowest command that proves the fix

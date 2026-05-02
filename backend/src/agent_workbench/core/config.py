@@ -68,6 +68,9 @@ class Settings:
     allowed_roots: tuple[Path, ...]
     workspace_root: Path
     data_dir: Path
+    workspace_agents_root: str
+    workspace_seed_readme: bool
+    allow_workspace_local_skills: bool
     default_model: str
     model_allowlist: tuple[str, ...]
     cors_origins: tuple[str, ...]
@@ -75,7 +78,7 @@ class Settings:
     remote_sandbox_token: str | None
     max_file_bytes: int = 1_000_000
     max_tree_entries: int = 2_000
-    command_timeout_seconds: int = 120
+    command_timeout_seconds: int = 360
     command_output_bytes: int = 80_000
     clerk_jwks_url: str | None = None
     clerk_issuer: str | None = None
@@ -106,6 +109,8 @@ class Settings:
             ],
             "allowedRoots": [str(path) for path in self.allowed_roots],
             "workspaceRoot": str(self.workspace_root),
+            "workspaceAgentsRoot": self.workspace_agents_root,
+            "workspaceSeedReadme": self.workspace_seed_readme,
             "currentWorkingDirectory": str(Path.cwd()),
             "tokenRequired": True,
             "clerkAuthEnabled": bool(self.clerk_jwks_url),
@@ -134,6 +139,10 @@ def get_settings() -> Settings:
         allowed_roots=_split_paths(configured_roots, workspace_root),
         workspace_root=workspace_root,
         data_dir=data_dir,
+        workspace_agents_root=os.getenv("WORKBENCH_WORKSPACE_AGENTS_ROOT", "agents").strip() or "agents",
+        workspace_seed_readme=os.getenv("WORKBENCH_WORKSPACE_SEED_README", "true").lower() in {"1", "true", "yes"},
+        allow_workspace_local_skills=os.getenv("WORKBENCH_ALLOW_WORKSPACE_LOCAL_SKILLS", "false").lower()
+        in {"1", "true", "yes"},
         default_model=default_model,
         model_allowlist=model_allowlist,
         cors_origins=_split_csv(
@@ -144,7 +153,7 @@ def get_settings() -> Settings:
         remote_sandbox_token=os.getenv("WORKBENCH_REMOTE_SANDBOX_TOKEN") or None,
         max_file_bytes=int(os.getenv("WORKBENCH_MAX_FILE_BYTES", "1000000")),
         max_tree_entries=int(os.getenv("WORKBENCH_MAX_TREE_ENTRIES", "2000")),
-        command_timeout_seconds=int(os.getenv("WORKBENCH_COMMAND_TIMEOUT_SECONDS", "120")),
+        command_timeout_seconds=int(os.getenv("WORKBENCH_COMMAND_TIMEOUT_SECONDS", "360")),
         command_output_bytes=int(os.getenv("WORKBENCH_COMMAND_OUTPUT_BYTES", "80000")),
         clerk_jwks_url=os.getenv("WORKBENCH_CLERK_JWKS_URL") or None,
         clerk_issuer=os.getenv("WORKBENCH_CLERK_ISSUER") or None,
