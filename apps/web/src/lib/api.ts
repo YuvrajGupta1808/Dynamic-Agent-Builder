@@ -7,6 +7,8 @@ import type {
   SessionMode,
   SessionRecord,
   StreamEvent,
+  TerminalClientEvent,
+  TerminalServerEvent,
   WorkspaceHealth,
   WorkspaceSummary,
   WorkspaceMode,
@@ -15,6 +17,7 @@ import { isClerkJwtRequired, resetLegacyWorkbenchToken, resolveApiToken } from "
 import { parseSseFrames } from "./sse";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
+const WS_BASE = API_BASE.replace(/^http/i, "ws");
 
 export class ApiError extends Error {
   status: number;
@@ -238,4 +241,46 @@ export async function transcribeAudio(file: Blob, model = "whisper-v3-turbo"): P
     throw new Error(text || response.statusText);
   }
   return (await response.json()) as { text: string };
+}
+
+export async function openTerminalSocket(
+  sessionId: string,
+  handlers: {
+    onEvent: (event: TerminalServerEvent) => void;
+    onOpen?: () => void;
+    onClose?: () => void;
+    onError?: () => void;
+  },
+): Promise<WebSocket> {
+  const token = await resolveApiToken();
+  const url = new URL(`${WS_BASE}/api/sessions/${sessionId}/terminal/ws`);
+  url.searchParams.set("token", token);
+  return await new Promise<WebSocket>((resolve, reject) => {
+    const socket = new WebSocket(url);
+    let settled = false;
+    socket.addEventListener("open", () => {
+      settled = true;
+      handlers.onOpen?.();
+      resolve(socket);
+    });
+    socket.addEventListener("message", (message) => {
+      try {
+        handlers.onEvent(JSON.parse(String(message.data)) as TerminalServerEvent);
+      } catch {
+        // Ignore malformed terminal frames.
+      }
+    });
+    socket.addEventListener("close", () => {
+      handlers.onClose?.();
+      if (!settled) reject(new Error("Unable to connect to terminal session"));
+    });
+    socket.addEventListener("error", () => {
+      handlers.onError?.();
+      if (!settled) reject(new Error("Unable to connect to terminal session"));
+    });
+  });
+}
+
+export function sendTerminalEvent(socket: WebSocket, event: TerminalClientEvent) {
+  socket.send(JSON.stringify(event));
 }

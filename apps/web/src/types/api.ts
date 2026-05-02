@@ -104,3 +104,14 @@ export interface ApprovalData {
   reason?: string | null;
   editedAction?: Record<string, unknown> | null;
 }
+
+export type TerminalClientEvent =
+  | { type: "input"; data: string }
+  | { type: "resize"; cols: number; rows: number }
+  | { type: "interrupt" };
+
+export type TerminalServerEvent =
+  | { type: "output"; data: string }
+  | { type: "status"; status: string; cwd?: string }
+  | { type: "exit"; exitCode: number }
+  | { type: "error"; message: string };

@@ -17,16 +17,23 @@ The current workbench is tuned for a Guild-building workflow where the main Deep
 
 ## Quick Start
 
+First-time setup:
+
 ```bash
 cp .env.example .env
 .venv/bin/python --version >/dev/null 2>&1 || python3.12 -m venv .venv
 .venv/bin/python -m pip install -U pip
 .venv/bin/python -m pip install -e "backend[deepagents,test]"
 pnpm install
-pnpm dev
 ```
 
-Open `http://127.0.0.1:5173`. The backend listens on `http://127.0.0.1:8787`.
+Start the application (backend and frontend together):
+
+```bash
+pnpm run dev
+```
+
+Open `http://127.0.0.1:5173`. The API is served at `http://127.0.0.1:8000`.
 
 The default model is `mock:deterministic`, so the app runs without provider credentials. Set `WORKBENCH_DEFAULT_MODEL=ollama:devstral-2` or another allowlisted provider model once the matching package and credentials are available.
 
@@ -89,10 +96,6 @@ Deployment-only async subagents are wired as an optional path because `deepagent
 Without that remote server surface, the workbench falls back to the synchronous specialist roster above.
 
 ## Backend
-
-```bash
-PYTHONPATH=backend/src .venv/bin/python -m uvicorn agent_workbench.main:app --host 127.0.0.1 --port 8787 --reload
-```
 
 The backend exposes the planned API surface, normalizes Deep Agents/LangGraph streaming events into app events, and falls back to a deterministic mock coding agent if `deepagents` is not installed.
 

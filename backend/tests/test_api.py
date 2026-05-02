@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from fastapi.testclient import TestClient
 
@@ -67,6 +68,45 @@ def test_create_session_and_stream(tmp_path: Path, monkeypatch) -> None:
         body = "".join(response.iter_text())
     assert "event: token" in body
     assert "event: done" in body
+
+
+def _recv_terminal_output(websocket, expected: str, attempts: int = 40) -> str:
+    chunks: list[str] = []
+    for _ in range(attempts):
+        event = websocket.receive_json()
+        if event["type"] == "output":
+            chunks.append(event["data"])
+            if expected in "".join(chunks):
+                break
+        if event["type"] == "status":
+            continue
+    return "".join(chunks)
+
+
+def test_terminal_websocket_runs_in_session_workspace(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path, monkeypatch)
+    client.post("/api/workspaces", headers=auth_headers(), json={"name": "project"})
+    session_response = client.post(
+        "/api/sessions",
+        headers=auth_headers(),
+        json={
+            "workspace": "project",
+            "workspaceMode": "local",
+            "mode": "accept_everything",
+            "model": "mock:deterministic",
+        },
+    )
+    session_id = session_response.json()["id"]
+    cwd = session_response.json()["cwd"]
+
+    with client.websocket_connect(f"/api/sessions/{session_id}/terminal/ws?token=test-token") as websocket:
+        websocket.send_text(json.dumps({"type": "input", "data": "pwd\n"}))
+        output = _recv_terminal_output(websocket, cwd, attempts=60)
+        assert cwd in output
+
+        websocket.send_text(json.dumps({"type": "input", "data": "cd agents\npwd\n"}))
+        output = _recv_terminal_output(websocket, f"{cwd}/agents", attempts=80)
+        assert f"{cwd}/agents" in output
 
 
 def test_managed_workspace_create_and_session(tmp_path: Path, monkeypatch) -> None:

@@ -2,7 +2,7 @@
 
 from fastapi import FastAPI
 
-from . import config, files, health, runs, sessions, workspaces
+from . import config, files, health, runs, sessions, terminal, workspaces
 
 
 def register_routes(app: FastAPI) -> None:
@@ -12,3 +12,4 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(sessions.router)
     app.include_router(files.router)
     app.include_router(runs.router)
+    app.include_router(terminal.router)

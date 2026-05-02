@@ -6,6 +6,7 @@ from functools import lru_cache
 
 from ..infra.session_store import SessionStore
 from ..infra.workspace import WorkspaceManager
+from ..services.terminal import TerminalManager
 from .config import get_settings
 
 
@@ -17,3 +18,8 @@ def get_store() -> SessionStore:
 @lru_cache(maxsize=1)
 def get_workspace_manager() -> WorkspaceManager:
     return WorkspaceManager(get_settings())
+
+
+@lru_cache(maxsize=1)
+def get_terminal_manager() -> TerminalManager:
+    return TerminalManager()

@@ -28,6 +28,7 @@ import remarkGfm from "remark-gfm";
 
 import { FileTree } from "../components/FileTree";
 import { Button } from "../components/ui/button";
+import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
 import {
     ApiError,
@@ -40,11 +41,14 @@ import {
     getFileTree,
     getWorkspaceHealth,
     getWorkspaces,
+    openTerminalSocket,
     repairWorkspace,
+    sendTerminalEvent,
     streamRun,
     transcribeAudio,
 } from "../lib/api";
 import { setRequireClerkJwt } from "../lib/auth-token";
+import { renderTerminalAnsi } from "../lib/terminal-ansi";
 import { cn } from "../lib/utils";
 import type {
     AppConfig,
@@ -54,6 +58,7 @@ import type {
     SessionMode,
     SessionRecord,
     StreamEvent,
+    TerminalServerEvent,
     TodoItem,
     WorkspaceHealth,
     WorkspaceSummary,
@@ -90,6 +95,8 @@ type ChatThread = {
   backendSession?: SessionRecord | null;
 };
 
+type TerminalTab = "user" | "agent";
+
 const WorkbenchEditorPane = memo(function WorkbenchEditorPane({
   selectedPath,
   workspaceBlocked,
@@ -105,10 +112,21 @@ const WorkbenchEditorPane = memo(function WorkbenchEditorPane({
   onSaveFile,
   onRepairWorkspace,
   onOpenWorkspaceModal,
-  terminalLines,
-  terminalOutputRef,
+  activeTerminalTab,
+  agentTerminalLines,
+  agentTerminalOutputRef,
+  userTerminalOutputRef,
+  renderedUserTerminalHtml,
+  userTerminalPromptLabel,
+  userTerminalCommand,
+  userTerminalConnected,
   terminalPanelRef,
-  onClearTerminal,
+  onActiveTerminalTabChange,
+  onClearAgentTerminal,
+  onClearUserTerminal,
+  onUserTerminalCommandChange,
+  onRunUserTerminalCommand,
+  onInterruptUserTerminal,
   onToggleTerminal,
 }: {
   selectedPath: string;
@@ -125,10 +143,21 @@ const WorkbenchEditorPane = memo(function WorkbenchEditorPane({
   onSaveFile: () => void;
   onRepairWorkspace: () => void;
   onOpenWorkspaceModal: () => void;
-  terminalLines: string[];
-  terminalOutputRef: RefObject<HTMLPreElement | null>;
+  activeTerminalTab: TerminalTab;
+  agentTerminalLines: string[];
+  agentTerminalOutputRef: RefObject<HTMLPreElement | null>;
+  userTerminalOutputRef: RefObject<HTMLDivElement | null>;
+  renderedUserTerminalHtml: string;
+  userTerminalPromptLabel: string;
+  userTerminalCommand: string;
+  userTerminalConnected: boolean;
   terminalPanelRef: ReturnType<typeof usePanelRef>;
-  onClearTerminal: () => void;
+  onActiveTerminalTabChange: (tab: TerminalTab) => void;
+  onClearAgentTerminal: () => void;
+  onClearUserTerminal: () => void;
+  onUserTerminalCommandChange: (value: string) => void;
+  onRunUserTerminalCommand: () => void;
+  onInterruptUserTerminal: () => void;
   onToggleTerminal: () => void;
 }) {
   return (
@@ -223,10 +252,32 @@ const WorkbenchEditorPane = memo(function WorkbenchEditorPane({
             <div className="terminal-header">
               <div>
                 <SquareTerminal />
-                <span>Terminal</span>
+                <button
+                  type="button"
+                  className={activeTerminalTab === "user" ? "terminal-tab active" : "terminal-tab"}
+                  onClick={() => onActiveTerminalTabChange("user")}
+                >
+                  User Terminal
+                </button>
+                <button
+                  type="button"
+                  className={activeTerminalTab === "agent" ? "terminal-tab active" : "terminal-tab"}
+                  onClick={() => onActiveTerminalTabChange("agent")}
+                >
+                  Agent Terminal
+                </button>
               </div>
               <div className="terminal-actions">
-                <Button variant="ghost" size="sm" onClick={onClearTerminal}>
+                {activeTerminalTab === "user" ? (
+                  <Button variant="ghost" size="sm" onClick={onInterruptUserTerminal}>
+                    Stop
+                  </Button>
+                ) : null}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={activeTerminalTab === "user" ? onClearUserTerminal : onClearAgentTerminal}
+                >
                   Clear
                 </Button>
                 <Button variant="ghost" size="icon" type="button" title="Close terminal" onClick={onToggleTerminal}>
@@ -234,9 +285,39 @@ const WorkbenchEditorPane = memo(function WorkbenchEditorPane({
                 </Button>
               </div>
             </div>
-            <pre className="terminal-output" ref={terminalOutputRef} tabIndex={-1}>
-              {terminalLines.join("\n")}
-            </pre>
+            {activeTerminalTab === "user" ? (
+              <>
+                <div className="terminal-output-shell">
+                  <div
+                    className="terminal-output terminal-output-html"
+                    ref={userTerminalOutputRef}
+                    tabIndex={-1}
+                    dangerouslySetInnerHTML={{ __html: renderedUserTerminalHtml }}
+                  />
+                  <form
+                    className="terminal-inline-prompt"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      onRunUserTerminalCommand();
+                    }}
+                  >
+                    <span className="terminal-prompt-label">{userTerminalPromptLabel}</span>
+                    <span className="terminal-prompt-arrow">❯</span>
+                    <Input
+                      value={userTerminalCommand}
+                      onChange={(event) => onUserTerminalCommandChange(event.target.value)}
+                      placeholder={userTerminalConnected ? "" : "Open a workspace to start the terminal"}
+                      readOnly={!userTerminalConnected}
+                      className="terminal-inline-input"
+                    />
+                  </form>
+                </div>
+              </>
+            ) : (
+              <pre className="terminal-output" ref={agentTerminalOutputRef} tabIndex={-1}>
+                {agentTerminalLines.join("\n")}
+              </pre>
+            )}
           </section>
         </Panel>
       </Group>
@@ -358,7 +439,11 @@ export function WorkbenchPage() {
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
   const [savedContent, setSavedContent] = useState("");
-  const [terminalLines, setTerminalLines] = useState<string[]>(["Agents terminal ready."]);
+  const [activeTerminalTab, setActiveTerminalTab] = useState<TerminalTab>("user");
+  const [agentTerminalLines, setAgentTerminalLines] = useState<string[]>(["Agent terminal ready."]);
+  const [userTerminalBuffer, setUserTerminalBuffer] = useState("Open a workspace to start the user terminal.\n");
+  const [userTerminalCommand, setUserTerminalCommand] = useState("");
+  const [userTerminalConnected, setUserTerminalConnected] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -390,7 +475,8 @@ export function WorkbenchPage() {
   const runInFlightRef = useRef(false);
   const didBootRef = useRef(false);
   const chatPaneRef = useRef<HTMLDivElement>(null);
-  const terminalOutputRef = useRef<HTMLPreElement>(null);
+  const agentTerminalOutputRef = useRef<HTMLPreElement>(null);
+  const userTerminalOutputRef = useRef<HTMLDivElement>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -398,6 +484,7 @@ export function WorkbenchPage() {
   const liveRefreshDebounceRef = useRef<number | null>(null);
   const liveRefreshPollRef = useRef<number | null>(null);
   const streamFlushRafRef = useRef<number | null>(null);
+  const terminalSocketRef = useRef<WebSocket | null>(null);
   const explorerPanelRef = usePanelRef();
   const chatPanelRef = usePanelRef();
   const terminalPanelRef = usePanelRef();
@@ -411,9 +498,18 @@ export function WorkbenchPage() {
     ta.style.height = `${Math.min(ta.scrollHeight, COMPOSER_TEXTAREA_MAX_PX)}px`;
   }, []);
 
-  const appendTerminalLines = useCallback((lines: string[]) => {
+  const appendAgentTerminalLines = useCallback((lines: string[]) => {
     if (!lines.length) return;
-    setTerminalLines((current) => [...current, ...lines].slice(-TERMINAL_LINE_LIMIT));
+    setAgentTerminalLines((current) => [...current, ...lines].slice(-TERMINAL_LINE_LIMIT));
+  }, []);
+
+  const appendUserTerminalText = useCallback((text: string) => {
+    if (!text) return;
+    setUserTerminalBuffer((current) => {
+      const next = `${current}${text}`;
+      if (next.length <= 80_000) return next;
+      return next.slice(next.length - 80_000);
+    });
   }, []);
 
   const clearLiveWorkspaceRefresh = useCallback(() => {
@@ -437,11 +533,11 @@ export function WorkbenchPage() {
 
   const scrollTerminalToBottom = useCallback(() => {
     requestAnimationFrame(() => {
-      const el = terminalOutputRef.current;
+      const el = activeTerminalTab === "user" ? userTerminalOutputRef.current : agentTerminalOutputRef.current;
       if (!el) return;
       el.scrollTop = el.scrollHeight;
     });
-  }, []);
+  }, [activeTerminalTab]);
 
   useEffect(() => {
     if (didBootRef.current) return;
@@ -455,6 +551,8 @@ export function WorkbenchPage() {
       cancelAnimationFrame(streamFlushRafRef.current);
       streamFlushRafRef.current = null;
     }
+    terminalSocketRef.current?.close();
+    terminalSocketRef.current = null;
   }, [clearLiveWorkspaceRefresh]);
 
   useEffect(() => {
@@ -492,7 +590,7 @@ export function WorkbenchPage() {
 
   useLayoutEffect(() => {
     scrollTerminalToBottom();
-  }, [scrollTerminalToBottom, terminalLines]);
+  }, [scrollTerminalToBottom, agentTerminalLines, userTerminalBuffer]);
 
   useEffect(() => {
     clearLiveWorkspaceRefresh();
@@ -505,6 +603,78 @@ export function WorkbenchPage() {
     return clearLiveWorkspaceRefresh;
   }, [clearLiveWorkspaceRefresh, isRunning, session?.id, workspaceIssue]);
 
+  useEffect(() => {
+    const pre = agentTerminalOutputRef.current;
+    if (!pre) return;
+    pre.textContent = agentTerminalLines.join("\n");
+  }, [agentTerminalLines]);
+
+  useEffect(() => {
+    terminalSocketRef.current?.close();
+    terminalSocketRef.current = null;
+    if (!session?.id || workspaceIssue) {
+      setUserTerminalConnected(false);
+      setUserTerminalBuffer(
+        workspaceIssue ? `${workspaceIssue.message}\n` : "Open a workspace to start the user terminal.\n",
+      );
+      return;
+    }
+    let active = true;
+    setUserTerminalConnected(false);
+    setUserTerminalBuffer("");
+    void openTerminalSocket(session.id, {
+      onOpen: () => {
+        if (!active) return;
+        setUserTerminalConnected(true);
+      },
+      onClose: () => {
+        if (!active) return;
+        setUserTerminalConnected(false);
+      },
+      onError: () => {
+        if (!active) return;
+        setUserTerminalConnected(false);
+      },
+      onEvent: (event: TerminalServerEvent) => {
+        if (!active) return;
+        if (event.type === "output") {
+          appendUserTerminalText(event.data);
+          return;
+        }
+        if (event.type === "status") {
+          setUserTerminalConnected(event.status === "connected");
+          return;
+        }
+        if (event.type === "exit") {
+          setUserTerminalConnected(false);
+          appendUserTerminalText(`\n[process exited ${event.exitCode}]\n`);
+          return;
+        }
+        if (event.type === "error") {
+          appendUserTerminalText(`\n[error] ${event.message}\n`);
+        }
+      },
+    })
+      .then((socket) => {
+        if (!active) {
+          socket.close();
+          return;
+        }
+        terminalSocketRef.current = socket;
+        sendTerminalEvent(socket, { type: "resize", cols: 120, rows: 30 });
+      })
+      .catch((err) => {
+        if (!active) return;
+        setUserTerminalConnected(false);
+        setUserTerminalBuffer(`Unable to connect to terminal: ${err instanceof Error ? err.message : "Unknown error"}\n`);
+      });
+    return () => {
+      active = false;
+      terminalSocketRef.current?.close();
+      terminalSocketRef.current = null;
+    };
+  }, [appendUserTerminalText, session?.id, session?.cwd, workspaceIssue]);
+
   const editorLanguage = useMemo(() => {
     if (selectedPath.endsWith(".py")) return "python";
     if (selectedPath.endsWith(".ts") || selectedPath.endsWith(".tsx")) return "typescript";
@@ -513,6 +683,13 @@ export function WorkbenchPage() {
     if (selectedPath.endsWith(".html")) return "html";
     return "markdown";
   }, [selectedPath]);
+
+  const renderedUserTerminalHtml = useMemo(() => renderTerminalAnsi(userTerminalBuffer), [userTerminalBuffer]);
+  const userTerminalPromptLabel = useMemo(() => {
+    const cwd = session?.cwd ?? "";
+    const segments = cwd.split("/").filter(Boolean);
+    return segments.at(-1) ?? "workspace";
+  }, [session?.cwd]);
 
   async function boot() {
     try {
@@ -538,7 +715,7 @@ export function WorkbenchPage() {
         setSavedContent("");
         setChatThreads([{ id: tid, title: "Agents", runs: [] }]);
         setActiveThreadId(tid);
-        setTerminalLines([
+        setAgentTerminalLines([
           "Welcome to Dynamic Agent Studio.",
           "Create a workspace (center panel) to open the editor, file tree, and agent.",
         ]);
@@ -631,7 +808,7 @@ export function WorkbenchPage() {
     structuredEventsSeenRef.current = false;
     backendFailureRef.current = false;
     setTree(null);
-    appendTerminalLines([`$ workspace ${name}`]);
+    appendAgentTerminalLines([`$ workspace ${name}`]);
     try {
       const health = await getWorkspaceHealth(name);
       if (health.status === "invalid") {
@@ -666,7 +843,7 @@ export function WorkbenchPage() {
       }
       throw err;
     }
-  }, [appendTerminalLines, clearLiveWorkspaceRefresh, config, openWorkspaceReadme, refreshWorkspace, selectedMode, selectedModel]);
+  }, [appendAgentTerminalLines, clearLiveWorkspaceRefresh, config, openWorkspaceReadme, refreshWorkspace, selectedMode, selectedModel]);
 
   function scheduleWorkspaceRefresh(sessionId = session?.id) {
     if (!isRunning || !sessionId || workspaceIssue) return;
@@ -686,7 +863,7 @@ export function WorkbenchPage() {
     try {
       const repaired = await repairWorkspace(activeWorkspace);
       setWorkspaceIssue(repaired.status === "invalid" ? repaired : null);
-      appendTerminalLines([
+      appendAgentTerminalLines([
         repaired.repairedEntries.length
           ? `[repair] moved ${repaired.repairedEntries.join(", ")}`
           : "[repair] workspace already healthy",
@@ -699,9 +876,9 @@ export function WorkbenchPage() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unable to repair workspace";
       setError(message);
-      appendTerminalLines([`[error] ${message}`]);
+      appendAgentTerminalLines([`[error] ${message}`]);
     }
-  }, [activeWorkspace, appendTerminalLines, openWorkspace]);
+  }, [activeWorkspace, appendAgentTerminalLines, openWorkspace]);
 
   const selectFile = useCallback(async (path: string) => {
     if (!session) return;
@@ -722,7 +899,7 @@ export function WorkbenchPage() {
       await refreshWorkspace();
       setWorkspaceIssue(null);
       setError(null);
-      appendTerminalLines([`[saved] ${selectedPath}`]);
+      appendAgentTerminalLines([`[saved] ${selectedPath}`]);
     } catch (err) {
       const issue = workspaceIssueFromError(err);
       if (issue) {
@@ -730,11 +907,11 @@ export function WorkbenchPage() {
       }
       const message = err instanceof Error ? err.message : "Unable to save file";
       setError(message);
-      appendTerminalLines([`[error] ${message}`]);
+      appendAgentTerminalLines([`[error] ${message}`]);
     } finally {
       setIsSaving(false);
     }
-  }, [appendTerminalLines, fileContent, selectedPath, session, refreshWorkspace]);
+  }, [appendAgentTerminalLines, fileContent, selectedPath, session, refreshWorkspace]);
 
   async function runAgent() {
     if (!config || isRunning || runInFlightRef.current) return;
@@ -766,7 +943,7 @@ export function WorkbenchPage() {
     setPendingApprovals([]);
     structuredEventsSeenRef.current = false;
     backendFailureRef.current = false;
-    appendTerminalLines(["", `$ agent ${userPrompt.slice(0, 90)}`]);
+    appendAgentTerminalLines(["", `$ agent ${userPrompt.slice(0, 90)}`]);
     let latestReasoningText = "";
     let sawAssistantToken = false;
     let sawAnyEvent = false;
@@ -785,7 +962,7 @@ export function WorkbenchPage() {
         streamFlushRafRef.current = null;
         setLiveRunBlocks([...nextBlocks]);
         if (queuedTerminalLines.length > 0) {
-          appendTerminalLines(queuedTerminalLines);
+          appendAgentTerminalLines(queuedTerminalLines);
           queuedTerminalLines = [];
         }
         if (queuedApprovals.length > 0) {
@@ -921,7 +1098,7 @@ export function WorkbenchPage() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Agent run failed";
       setError(message);
-      appendTerminalLines([`[error] ${message}`]);
+      appendAgentTerminalLines([`[error] ${message}`]);
       nextBlocks = appendRunBlock(nextBlocks, { id: crypto.randomUUID(), kind: "error", text: message, eventType: "error" });
       setLiveRunBlocks(nextBlocks);
       structuredEventsSeenRef.current = true;
@@ -991,14 +1168,14 @@ export function WorkbenchPage() {
         editedAction: options.editedAction,
       });
       const approvalLabel = approvalCheckpointLabel(approval);
-      appendTerminalLines([`[${decision}] ${approval.tool}${approvalLabel ? ` (${approvalLabel})` : ""}`]);
+      appendAgentTerminalLines([`[${decision}] ${approval.tool}${approvalLabel ? ` (${approvalLabel})` : ""}`]);
       setPendingApprovals((current) => current.filter((item) => item.interruptId !== approval.interruptId));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to submit approval decision.");
     } finally {
       setIsDecidingApproval(false);
     }
-  }, [approval, appendTerminalLines]);
+  }, [approval, appendAgentTerminalLines]);
 
   const approveCurrentApproval = useCallback(async () => {
     await handleApproval("approve");
@@ -1156,8 +1333,8 @@ export function WorkbenchPage() {
   const workspaceMissing = workspaces.length === 0 || !session;
   const workspaceBlocked = workspaceIssue !== null;
 
-  const clearTerminal = useCallback(() => {
-    setTerminalLines(
+  const clearAgentTerminal = useCallback(() => {
+    setAgentTerminalLines(
       workspaceBlocked
         ? [workspaceIssue?.message ?? "Workspace is blocked."]
         : workspaceMissing
@@ -1165,9 +1342,34 @@ export function WorkbenchPage() {
               "Welcome to Dynamic Agent Studio.",
               "Create a workspace (center panel) to open the editor, file tree, and agent.",
             ]
-          : ["Agents terminal ready."],
+          : ["Agent terminal ready."],
     );
   }, [workspaceBlocked, workspaceIssue?.message, workspaceMissing]);
+
+  const clearUserTerminal = useCallback(() => {
+    setUserTerminalBuffer(
+      workspaceBlocked
+        ? `${workspaceIssue?.message ?? "Workspace is blocked."}\n`
+        : workspaceMissing
+          ? "Open a workspace to start the user terminal.\n"
+          : "",
+    );
+  }, [workspaceBlocked, workspaceIssue?.message, workspaceMissing]);
+
+  const runUserTerminalCommand = useCallback(() => {
+    const command = userTerminalCommand.trim();
+    const socket = terminalSocketRef.current;
+    if (!command || !socket || socket.readyState !== WebSocket.OPEN) return;
+    sendTerminalEvent(socket, { type: "input", data: `${command}\n` });
+    setUserTerminalCommand("");
+  }, [userTerminalCommand]);
+
+  const interruptUserTerminal = useCallback(() => {
+    const socket = terminalSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    sendTerminalEvent(socket, { type: "interrupt" });
+    appendUserTerminalText("^C\n");
+  }, [appendUserTerminalText]);
 
   return (
     <>
@@ -1336,10 +1538,21 @@ export function WorkbenchPage() {
               onSaveFile={saveFile}
               onRepairWorkspace={repairActiveWorkspace}
               onOpenWorkspaceModal={openWorkspaceModal}
-              terminalLines={terminalLines}
-              terminalOutputRef={terminalOutputRef}
+              activeTerminalTab={activeTerminalTab}
+              agentTerminalLines={agentTerminalLines}
+              agentTerminalOutputRef={agentTerminalOutputRef}
+              userTerminalOutputRef={userTerminalOutputRef}
+              renderedUserTerminalHtml={renderedUserTerminalHtml}
+              userTerminalPromptLabel={userTerminalPromptLabel}
+              userTerminalCommand={userTerminalCommand}
+              userTerminalConnected={userTerminalConnected}
               terminalPanelRef={terminalPanelRef}
-              onClearTerminal={clearTerminal}
+              onActiveTerminalTabChange={setActiveTerminalTab}
+              onClearAgentTerminal={clearAgentTerminal}
+              onClearUserTerminal={clearUserTerminal}
+              onUserTerminalCommandChange={setUserTerminalCommand}
+              onRunUserTerminalCommand={runUserTerminalCommand}
+              onInterruptUserTerminal={interruptUserTerminal}
               onToggleTerminal={toggleTerminal}
             />
           </Panel>
