@@ -1,0 +1,3 @@
+[agent]
+name = "trigger_specialist"
+description = "Designs Guild trigger flows and validates whether webhook or scheduled triggers fit the use case."

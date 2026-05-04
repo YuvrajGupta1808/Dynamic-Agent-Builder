@@ -1,0 +1,3 @@
+[agent]
+name = "context_specialist"
+description = "Handles explicit context/memory requests when they cannot stay implicit in the orchestrator flow."

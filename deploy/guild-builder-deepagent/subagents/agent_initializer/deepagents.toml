@@ -1,0 +1,3 @@
+[agent]
+name = "agent_initializer"
+description = "Creates Guild agent folders, selects the right init flow, and handles per-agent scaffolding setup."

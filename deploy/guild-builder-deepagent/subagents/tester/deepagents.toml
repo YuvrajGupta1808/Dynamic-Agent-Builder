@@ -1,0 +1,3 @@
+[agent]
+name = "tester"
+description = "Runs Guild tests and focused validation commands, then summarizes what passed, failed, and what should be rerun next."

@@ -1,0 +1,11 @@
+[agent]
+name = "guild-builder-deepagent"
+# Same convention as WORKBENCH_DEFAULT_MODEL / build_agent Fireworks branch (agents.py).
+model = "openai:accounts/fireworks/models/glm-4p7"
+
+# Optional: enable when you need shell/code (Guild CLI) in cloud sandboxes.
+# [sandbox]
+# provider = "daytona"
+# template = "deepagents-deploy"
+# image = "python:3.12"
+# scope = "thread"

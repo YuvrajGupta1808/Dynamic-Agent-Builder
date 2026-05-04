@@ -1,0 +1,3 @@
+[agent]
+name = "editor"
+description = "Adapts Guild project files to the actual use case and removes generic template output."

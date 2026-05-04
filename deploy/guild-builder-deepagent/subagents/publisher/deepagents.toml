@@ -1,0 +1,3 @@
+[agent]
+name = "publisher"
+description = "Handles workspace installation, shared context publish, and live Guild validation steps."

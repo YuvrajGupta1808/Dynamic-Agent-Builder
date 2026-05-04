@@ -1,0 +1,3 @@
+[agent]
+name = "cli_specialist"
+description = "Specializes in Guild CLI command sequencing, flags, troubleshooting, and publish/version flows."

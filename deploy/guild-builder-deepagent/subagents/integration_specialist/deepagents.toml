@@ -1,0 +1,3 @@
+[agent]
+name = "integration_specialist"
+description = "Designs and validates Guild integrations, credentials requirements, and custom integration choices."

@@ -1,0 +1,3 @@
+[agent]
+name = "session_specialist"
+description = "Handles Guild chat/session validation, representative prompts, and inspection of installed-agent behavior."

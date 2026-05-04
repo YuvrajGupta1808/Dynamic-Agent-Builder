@@ -101,6 +101,7 @@ The backend exposes the planned API surface, normalizes Deep Agents/LangGraph st
 
 Notable backend behaviors:
 
+- Optional LangSmith **Deep Agents Deploy** bundle for the same orchestrator/spec specialists lives under [`deploy/guild-builder-deepagent/README.md`](deploy/guild-builder-deepagent/README.md) (regenerated via `backend/scripts/export_deepagents_bundle.py`).
 - Workspace files are scoped to managed workspaces under `workspaces/`.
 - Guild builder memory and built-in skills are store-backed rather than forced onto disk.
 - The default Deep Agents `general-purpose` subagent is disabled in favor of explicit specialists.

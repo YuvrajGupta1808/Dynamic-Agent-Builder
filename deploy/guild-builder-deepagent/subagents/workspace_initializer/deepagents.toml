@@ -1,0 +1,3 @@
+[agent]
+name = "workspace_initializer"
+description = "Creates or selects Guild workspaces and handles workspace-level bootstrap steps."

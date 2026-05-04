@@ -1,0 +1,3 @@
+[agent]
+name = "sdk_specialist"
+description = "Specializes in Guild SDK code patterns, template-specific implementation rules, and non-LLM agent shapes."

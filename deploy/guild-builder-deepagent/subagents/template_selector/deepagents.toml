@@ -1,0 +1,3 @@
+[agent]
+name = "template_selector"
+description = "Chooses and justifies Guild agent templates per role."

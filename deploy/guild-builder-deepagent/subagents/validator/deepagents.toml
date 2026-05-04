@@ -1,0 +1,3 @@
+[agent]
+name = "validator"
+description = "Reviews Guild CLI and chat validation output for the next smallest fix."

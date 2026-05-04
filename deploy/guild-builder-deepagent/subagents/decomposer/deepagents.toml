@@ -1,0 +1,3 @@
+[agent]
+name = "decomposer"
+description = "Splits a user request into the right set of Guild agents and responsibilities."
